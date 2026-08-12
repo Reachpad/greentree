@@ -12,6 +12,7 @@ and refuses to create a commit from any tree that has not passed.
 </p>
 
 <p align="center">
+Built for coding agents: one verb, JSON on every command, stable exit codes, and a drop-in skill.<br>
 An open source primitive from <a href="https://reachpad.dev">reachpad</a> · Apache-2.0 · Linux and macOS
 </p>
 
@@ -210,15 +211,35 @@ freely with a running watcher.
 
 ### For coding agents
 
-The agent-facing contract is one verb and one exit-code table:
+An agent is the primary user. The whole interface an agent needs is one
+verb and one exit-code table:
 
 ```sh
-greentree gate --json -m "<message>"
+greentree gate --json -m "<message>"    # verify, then commit the tree; idempotent
 ```
 
-[docs/AGENTS.md](docs/AGENTS.md) has the copy-paste project-instructions
+Every command takes `--json` (exactly one object on stdout) and returns a
+stable exit code, so an agent branches on the code, never on parsed text:
+`0` committed, `10` a check failed (output at `.log_tail`), `11` not
+verified yet (run `test` first), `12` unsnapshotable, `13` locked. No
+prose to interpret, no re-running "to be sure" — a cache hit proves the
+content already passed.
+
+**Drop-in skill.** [`skills/greentree/`](skills/greentree/SKILL.md) is a
+Claude Code skill that teaches an agent the workflow and the exit codes.
+Copy it into a project so the agent loads it automatically:
+
+```sh
+cp -r skills/greentree .claude/skills/
+```
+
+The skill tells the agent to land changes with `greentree gate` instead of
+raw `git commit`/`git push`, how to react to each exit code, and not to
+re-run cached verdicts.
+
+**Enforce it.** [docs/AGENTS.md](docs/AGENTS.md) has a project-instructions
 snippet and a Claude Code hook that blocks `git commit`/`git push` so the
-gate is the only door.
+gate is the only door, even if the agent forgets.
 
 ### The gate before GitHub
 
