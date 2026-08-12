@@ -37,8 +37,9 @@ tree_hash() {
 cp .git/index "$shadow"
 
 # --- a verdict cache keyed by tree hash (files, not `declare -A`:
-# macOS ships bash 3.2, and content-addressed files are the point anyway)
-cachedir=$demo/.verdicts
+# macOS ships bash 3.2, and content-addressed files are the point anyway).
+# Lives under .git so it never dirties the tree it is caching verdicts for.
+cachedir=$demo/.git/verdicts
 mkdir -p "$cachedir"
 run_check() {
   local tree=$1 v
@@ -80,4 +81,10 @@ echo "  verified tree:    ${t4:0:12}"
 
 say "History: 3 attempts, 1 test execution per unique tree, 1 commit"
 git log --oneline
-[[ -z $(git status --porcelain) ]] && echo "  working tree clean after publish"
+if [[ -z $(git status --porcelain) ]]; then
+  echo "  working tree clean after publish"
+else
+  echo "  ERROR: working tree dirty after publish"
+  git status --porcelain
+  exit 1
+fi
