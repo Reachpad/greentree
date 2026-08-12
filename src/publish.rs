@@ -71,36 +71,7 @@ pub fn publish(
     // A leftover journal must never bypass verification: the environment
     // fingerprint may have changed since the interrupted publish, and a
     // journal is plain JSON anyone could write.
-    let (env_fp, _) = env_fingerprint(&git.root, &cfg.inputs)?;
-    let now = SystemTime::now();
-    let mut verified_by = Vec::new();
-    for (name, check) in cfg.required_checks() {
-        let key = VerdictKey {
-            tree: tree.clone(),
-            check: name.clone(),
-            check_hash: check.hash(),
-            env_fingerprint: env_fp.clone(),
-        };
-        let v = store.get(&key).ok_or_else(|| Error::NotVerified {
-            tree: short(&tree).to_string(),
-            reason: format!("check {name:?} has no verdict for this tree; run `greentree test`"),
-        })?;
-        if v.outcome != Outcome::Pass {
-            return Err(Error::NotVerified {
-                tree: short(&tree).to_string(),
-                reason: format!("check {name:?} last {} on this tree", v.outcome.as_str()),
-            });
-        }
-        if !v.is_fresh(check.fresh_duration()?, now) {
-            return Err(Error::NotVerified {
-                tree: short(&tree).to_string(),
-                reason: format!(
-                    "check {name:?} passed but the verdict is older than its fresh window"
-                ),
-            });
-        }
-        verified_by.push(name.clone());
-    }
+    let verified_by = verify_tree(git, cfg, store, &tree)?;
 
     // Resume path: a prior publish created the commit and moved the ref but
     // was interrupted before finishing (index sync or push). The gate above
@@ -244,6 +215,81 @@ pub fn publish(
         pushed,
         resumed: false,
         verified_by,
+    })
+}
+
+/// The verification gate, shared by publish, attest, and serve: every
+/// required check must hold a passing verdict for exactly `tree`, fresh
+/// within its window, under the CURRENT environment fingerprint. Returns
+/// the check names that verified.
+pub fn verify_tree(
+    git: &Git,
+    cfg: &Config,
+    store: &dyn VerdictStore,
+    tree: &str,
+) -> Result<Vec<String>> {
+    let (env_fp, _) = env_fingerprint(&git.root, &cfg.inputs)?;
+    let now = SystemTime::now();
+    let mut verified_by = Vec::new();
+    for (name, check) in cfg.required_checks() {
+        let key = VerdictKey {
+            tree: tree.to_string(),
+            check: name.clone(),
+            check_hash: check.hash(),
+            env_fingerprint: env_fp.clone(),
+        };
+        let v = store.get(&key).ok_or_else(|| Error::NotVerified {
+            tree: short(tree).to_string(),
+            reason: format!("check {name:?} has no verdict for this tree; run `greentree test`"),
+        })?;
+        if v.outcome != Outcome::Pass {
+            return Err(Error::NotVerified {
+                tree: short(tree).to_string(),
+                reason: format!("check {name:?} last {} on this tree", v.outcome.as_str()),
+            });
+        }
+        if !v.is_fresh(check.fresh_duration()?, now) {
+            return Err(Error::NotVerified {
+                tree: short(tree).to_string(),
+                reason: format!(
+                    "check {name:?} passed but the verdict is older than its fresh window"
+                ),
+            });
+        }
+        verified_by.push(name.clone());
+    }
+    Ok(verified_by)
+}
+
+/// What `attest` stamps: HEAD, whose tree must be byte-identical to the
+/// working tree and verified by every required check. Attesting a commit
+/// whose tree differs from what was tested would make the status a lie.
+#[derive(Debug, serde::Serialize)]
+pub struct AttestTarget {
+    pub commit: String,
+    pub tree: String,
+    pub checks: Vec<String>,
+}
+
+pub fn attest_target(git: &Git, cfg: &Config, store: &dyn VerdictStore) -> Result<AttestTarget> {
+    let tree = crate::snapshot::snapshot(git, cfg)?;
+    let commit = git
+        .rev_parse_opt("HEAD")?
+        .ok_or_else(|| Error::Publish("no commits yet; nothing to attest".into()))?;
+    let head_tree = git.run(["rev-parse", &format!("{commit}^{{tree}}")])?;
+    if head_tree != tree {
+        return Err(Error::NotVerified {
+            tree: short(&tree).to_string(),
+            reason: "the working tree differs from HEAD; attest stamps only committed state \
+                     (commit or stash first, or use `gate`)"
+                .into(),
+        });
+    }
+    let checks = verify_tree(git, cfg, store, &tree)?;
+    Ok(AttestTarget {
+        commit,
+        tree,
+        checks,
     })
 }
 

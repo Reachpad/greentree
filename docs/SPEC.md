@@ -136,7 +136,36 @@ check — context `greentree/<check>`, state `success`, description
 - Best-effort: a failed post never fails the publish (`statuses_error` in
   the JSON, warning on stderr). Rerunning `publish --push` re-posts; the
   same context overwrites, so retries are idempotent.
-- Only `success` is ever posted — unverified trees never get pushed.
+- `publish` and `attest` post only `success` (they refuse unverified trees
+  before posting). `serve` posts real outcomes, including `failure` — a
+  failing pushed commit deserves a red X, not silence.
+
+### Attest (the normal-git-push half of the loop)
+
+`greentree attest` posts `greentree/<check>` statuses for HEAD, given:
+the working tree is byte-identical to HEAD's tree (attest stamps only
+committed state), and every required check holds a passing fresh verdict
+for that tree. No commit is created; nothing is pushed. Flow: verify
+while working, commit and push with plain git, attest. Refusals use exit
+11; a missing token is exit 15.
+
+### Serve (the persistent warm runner)
+
+`greentree serve [--remote R] [--branch B] [--interval 30s] [--once]`
+turns a dedicated clone on an always-on machine into the CI:
+
+- Polls `R/B`; on a new SHA: `checkout --detach` + `reset --hard` +
+  `git clean -fd` (ignored files — the warm caches — survive), runs the
+  required checks in the warm working copy, and posts one status per
+  outcome.
+- serve OWNS its clone and refuses to start over uncommitted changes.
+- Verdicts are tree-keyed as everywhere else: re-pushed content, reverts,
+  and message-only rewrites are cache hits and re-attest instantly.
+- Statuses are only posted when every verdict binds to the commit's own
+  tree (a check that mutates the repo forfeits attestation for that run).
+- A commit that cannot be verified at all (broken config, infra error) is
+  logged, recorded as seen, and skipped — the loop never wedges.
+- State: `<git-dir>/greentree/serve-last` (last handled SHA).
 
 ## Exit codes (stable contract)
 
@@ -172,6 +201,10 @@ Errors in JSON mode print `{"error": "...", "exit_code": N}`. Shapes:
   duration_ms}], publish}` — `publish` is the same object the `publish`
   verb prints (statuses fields included) — or
   `{gate: "refused", check, tree, outcome, log, log_tail}`
+- `attest`: `{commit, tree, checks, statuses_posted}`
+- `serve --json`: one line per handled commit:
+  `{commit, tree, ok, results: [{check, outcome, cached, duration_ms}],
+  statuses_posted}`
 - `init`: `{config_written, config_path, checks, tree}`
 - `watch --json`: one line per visible cycle:
   `{tree, results: [{check, outcome, cached, duration_ms}]}`

@@ -1,14 +1,12 @@
 name: ci
 
-# greentree's CI is greentree: the composite action installs the tool from
-# this checkout and runs `greentree test`, whose `full` check is the whole
-# gate (build + clippy + fmt + nextest + no-default-features + demo). The
-# verdict cache in .git/greentree is restored across runs, so a re-run on
-# content that already passed costs nothing.
+# greentree's CI is `greentree serve` on a warm machine, which verifies
+# every pushed commit and posts greentree/<check> statuses. This workflow
+# is the cold-isolation fallback for pull requests (fork code should not
+# run on the warm runner). It installs greentree from the checkout and
+# runs the same `full` check the serve loop runs.
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 jobs:

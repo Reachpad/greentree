@@ -672,6 +672,103 @@ fn directory_inputs_are_fingerprinted() {
     assert!(!r3.cached, "edit inside a directory input must invalidate");
 }
 
+#[test]
+fn attest_refuses_dirty_and_stamps_committed_state() {
+    let (tmp, git) = repo();
+    let cfg = config("test -f feature.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+
+    // The normal-git flow: edit, verify while dirty, commit with plain git.
+    sh(tmp.path(), "echo done > feature.txt");
+    let (name, check) = check_of(&cfg);
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    assert_eq!(r.verdict.outcome, Outcome::Pass);
+
+    // Dirty tree: attest must refuse (HEAD's tree is not the verified one).
+    match greentree::publish::attest_target(&git, &cfg, &store) {
+        Err(Error::NotVerified { reason, .. }) => {
+            assert!(reason.contains("HEAD"), "reason: {reason}")
+        }
+        other => panic!("attest on dirty tree: {other:?}"),
+    }
+
+    // Plain git commit of the same content: attest now targets HEAD with
+    // the verdict recorded while the tree was dirty.
+    sh(
+        tmp.path(),
+        "git add -A && git commit -qm 'plain git commit'",
+    );
+    let target = greentree::publish::attest_target(&git, &cfg, &store).unwrap();
+    assert_eq!(target.tree, r.verdict.tree);
+    assert_eq!(target.checks, vec!["test".to_string()]);
+    assert_eq!(target.commit, sh(tmp.path(), "git rev-parse HEAD"));
+}
+
+#[test]
+fn serve_verifies_new_commits_from_a_remote() {
+    // Full loop against a local bare remote (not GitHub, so status posting
+    // is skipped and the verification machinery is what's under test).
+    let bare = TempDir::new().unwrap();
+    sh(bare.path(), "git init -q --bare -b main");
+    let bare_path = bare.path().display().to_string();
+
+    let (dev, _devgit) = repo();
+    sh(
+        dev.path(),
+        &format!(
+            "printf 'version: 1\\nchecks:\\n  test:\\n    run: \"test -f base.txt\"\\n    required_for_publish: true\\n' > greentree.yaml \
+             && git add -A && git commit -qm config \
+             && git remote add origin {bare_path} && git push -q origin main"
+        ),
+    );
+
+    let runner = TempDir::new().unwrap();
+    let runner_repo = runner.path().join("clone");
+    sh(
+        runner.path(),
+        &format!("git clone -q {bare_path} clone && cd clone && git config user.name t && git config user.email t@t"),
+    );
+
+    // A new commit lands on the remote from the dev clone.
+    sh(
+        dev.path(),
+        "echo update > new.txt && git add -A && git commit -qm update && git push -q origin main",
+    );
+    let pushed = sh(dev.path(), "git rev-parse HEAD");
+
+    let (code, stdout, stderr) = bin(
+        &runner_repo,
+        &["serve", "--once", "--json", "--branch", "main"],
+    );
+    assert_eq!(
+        code, 0,
+        "serve --once failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let line = stdout.lines().last().expect("one commit line");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(v["commit"], serde_json::Value::String(pushed.clone()));
+    assert_eq!(v["ok"], serde_json::Value::Bool(true));
+    assert_eq!(v["results"][0]["outcome"], "pass");
+
+    // The runner clone recorded the sha and holds the verdict for its tree.
+    let last = sh(&runner_repo, "cat .git/greentree/serve-last");
+    assert_eq!(last, pushed);
+
+    // A failing commit gets ok:false, and serve still exits cleanly.
+    sh(
+        dev.path(),
+        "rm base.txt && git add -A && git commit -qm break && git push -q origin main",
+    );
+    let (code, stdout, _) = bin(
+        &runner_repo,
+        &["serve", "--once", "--json", "--branch", "main"],
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(v["results"][0]["outcome"], "fail");
+}
+
 // ---- exit-code contract through the real binary ----
 
 fn bin(dir: &Path, args: &[&str]) -> (i32, String, String) {

@@ -61,6 +61,41 @@ fn dispatch(cli: &Cli, dir: &Path) -> crate::Result<u8> {
             Ok(exit::OK)
         }
         Command::Gate { push, message } => gate(cli, &git, *push, message.clone()),
+        Command::Attest => attest(cli, &git),
+        Command::Serve {
+            remote,
+            branch,
+            interval,
+            once,
+        } => {
+            let branch = match branch {
+                Some(b) => b.clone(),
+                None => {
+                    let out = git.run_unchecked(["symbolic-ref", "-q", "--short", "HEAD"])?;
+                    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if b.is_empty() {
+                        return Err(Error::Config(
+                            "HEAD is detached; pass --branch explicitly".into(),
+                        ));
+                    }
+                    b
+                }
+            };
+            let interval = humantime::parse_duration(interval)
+                .map_err(|e| Error::Config(format!("invalid interval {interval:?}: {e}")))?
+                .max(std::time::Duration::from_secs(5));
+            crate::serve::serve(
+                &git,
+                &crate::serve::ServeOptions {
+                    remote: remote.clone(),
+                    branch,
+                    interval,
+                    once: *once,
+                    json: cli.json,
+                },
+            )?;
+            Ok(exit::OK)
+        }
         Command::Watch { once } => {
             crate::watch::watch(
                 &git,
@@ -387,6 +422,45 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
             println!("  {name} ✓{}", if r.cached { " (cached)" } else { "" });
         }
         emit_publish(cli, &report, &statuses);
+    }
+    Ok(exit::OK)
+}
+
+/// Post statuses for HEAD if its tree is verified. The half of the loop
+/// that lets a NORMAL `git push` end attested: verify while working, push
+/// with plain git, then attest (locally or from `serve`).
+#[cfg(not(feature = "github"))]
+fn attest(_cli: &Cli, _git: &Git) -> crate::Result<u8> {
+    Err(Error::Config(
+        "this greentree was built without the `github` feature; attest cannot post".into(),
+    ))
+}
+
+#[cfg(feature = "github")]
+fn attest(cli: &Cli, git: &Git) -> crate::Result<u8> {
+    let _lock = lock::acquire(&git.state_dir())?;
+    let cfg = Config::effective(&git.root)?;
+    let store = JsonStore::open(&git.state_dir())?;
+    let target = crate::publish::attest_target(git, &cfg, &store)?;
+    let posted = crate::github::post_statuses(git, &target.commit, &target.tree, &target.checks)?;
+
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "commit": target.commit,
+                "tree": target.tree,
+                "checks": target.checks,
+                "statuses_posted": posted,
+            })
+        );
+    } else {
+        println!(
+            "attested commit {} (tree {}): {}",
+            short(&target.commit),
+            short(&target.tree),
+            posted.join(", ")
+        );
     }
     Ok(exit::OK)
 }
