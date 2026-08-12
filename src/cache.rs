@@ -128,47 +128,46 @@ pub trait VerdictStore {
     fn put(&mut self, verdict: Verdict) -> Result<()>;
 }
 
-/// v0.x store: one JSON file under the global flock. Verdicts are held as
-/// raw JSON and deserialized only on a key hit, so lookups and writes stay
-/// O(one verdict) in parse cost even when thousands accumulate. Remote org
-/// caches implement the same trait.
+/// v0.x store: an append-only JSONL log under the global flock, one record
+/// per line, keyed in memory by verdict key (last line wins). `put` appends
+/// a single line, so a write is O(one verdict) regardless of how many have
+/// accumulated; `get` reads the in-memory map. `gc` compacts the log back
+/// to one line per live key. Remote org caches implement the same trait.
 pub struct JsonStore {
     path: PathBuf,
     verdicts: BTreeMap<String, Box<serde_json::value::RawValue>>,
 }
 
-#[derive(Default, Deserialize)]
-struct FileFormat {
-    #[allow(dead_code)]
-    schema_version: u32,
-    verdicts: BTreeMap<String, Box<serde_json::value::RawValue>>,
-}
-
-#[derive(Serialize)]
-struct FileFormatRef<'a> {
-    schema_version: u32,
-    verdicts: &'a BTreeMap<String, Box<serde_json::value::RawValue>>,
-}
-
 impl JsonStore {
     pub fn open(state_dir: &Path) -> Result<JsonStore> {
-        let path = state_dir.join("verdicts.json");
-        let verdicts = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<FileFormat>(&bytes)
-                .map(|f| f.verdicts)
-                .unwrap_or_default(), // corrupt/old cache = empty cache, never fatal
-            Err(_) => BTreeMap::new(),
-        };
+        let path = state_dir.join("verdicts.jsonl");
+        let mut verdicts = BTreeMap::new();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // A line that fails to parse (partial append after a crash,
+                // schema drift) is skipped: the store is a cache, never fatal.
+                if let Ok(raw) = serde_json::from_str::<Box<serde_json::value::RawValue>>(line) {
+                    if let Ok(v) = serde_json::from_str::<Verdict>(raw.get()) {
+                        verdicts.insert(v.key().as_string(), raw);
+                    }
+                }
+            }
+        }
         Ok(JsonStore { path, verdicts })
     }
 
-    fn persist(&self) -> Result<()> {
-        let file = FileFormatRef {
-            schema_version: VERDICT_SCHEMA_VERSION,
-            verdicts: &self.verdicts,
-        };
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&file)?)?;
+    /// Rewrite the log with one line per live verdict. Called by `gc`.
+    pub fn compact(&self) -> Result<()> {
+        let mut buf = String::new();
+        for raw in self.verdicts.values() {
+            buf.push_str(raw.get());
+            buf.push('\n');
+        }
+        let tmp = self.path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, buf)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -184,8 +183,18 @@ impl VerdictStore for JsonStore {
     fn put(&mut self, verdict: Verdict) -> Result<()> {
         debug_assert!(verdict.outcome.cacheable(), "only pass/fail are cacheable");
         let raw = serde_json::value::to_raw_value(&verdict)?;
+        let mut line = raw.get().to_string();
+        line.push('\n');
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            f.write_all(line.as_bytes())?;
+        }
         self.verdicts.insert(verdict.key().as_string(), raw);
-        self.persist()
+        Ok(())
     }
 }
 
