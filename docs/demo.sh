@@ -36,16 +36,19 @@ tree_hash() {
 }
 cp .git/index "$shadow"
 
-# --- a verdict cache keyed by tree hash
-declare -A verdict
+# --- a verdict cache keyed by tree hash (files, not `declare -A`:
+# macOS ships bash 3.2, and content-addressed files are the point anyway)
+cachedir=$demo/.verdicts
+mkdir -p "$cachedir"
 run_check() {
-  local tree=$1
-  if [[ -n "${verdict[$tree]:-}" ]]; then
-    echo "  tree ${tree:0:12}  CACHE HIT: ${verdict[$tree]}"
+  local tree=$1 v
+  if [[ -f "$cachedir/$tree" ]]; then
+    echo "  tree ${tree:0:12}  CACHE HIT: $(cat "$cachedir/$tree")"
     return
   fi
-  if bash check.sh; then verdict[$tree]=pass; else verdict[$tree]=fail; fi
-  echo "  tree ${tree:0:12}  ran check: ${verdict[$tree]}"
+  if bash check.sh; then v=pass; else v=fail; fi
+  echo "$v" > "$cachedir/$tree"
+  echo "  tree ${tree:0:12}  ran check: $v"
 }
 
 say "Attempt 1: agent writes the wrong thing"
@@ -65,7 +68,7 @@ echo "  reverted tree ${t4:0:12} == attempt-2 tree ${t2:0:12}: $([ "$t4" = "$t2"
 run_check "$t4"   # <- no test process runs; the verdict is content-addressed
 
 say "Publish: commit is created FROM the verified tree object"
-[[ "${verdict[$t4]}" == pass ]] || { echo "gate refuses: tree not verified"; exit 1; }
+[[ $(cat "$cachedir/$t4") == pass ]] || { echo "gate refuses: tree not verified"; exit 1; }
 commit=$(git commit-tree "$t4" -p "$base" -m "verified: add() implemented")
 git update-ref refs/heads/main "$commit" "$base"
 git reset -q  # sync the real index to the new HEAD
