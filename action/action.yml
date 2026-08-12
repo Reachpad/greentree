@@ -42,7 +42,10 @@ runs:
       shell: bash
       run: |
         if [ -n "${{ inputs.path }}" ]; then
-          cargo install --locked --path "${{ inputs.path }}" greentree
+          # Build in the checkout's own target/, which Swatinem/rust-cache
+          # restores, instead of cargo install's uncached temp dir.
+          ( cd "${{ inputs.path }}" && cargo build --release --locked )
+          echo "${{ inputs.path }}/target/release" >> "$GITHUB_PATH"
         elif ! command -v greentree >/dev/null 2>&1; then
           cargo install --locked \
             --git https://github.com/reachpad/greentree \

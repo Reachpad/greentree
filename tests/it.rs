@@ -705,6 +705,41 @@ fn attest_refuses_dirty_and_stamps_committed_state() {
 }
 
 #[test]
+fn verdict_log_appends_and_gc_compacts() {
+    // put() must append (O(1) write, not full rewrite), survive reopen, and
+    // gc must collapse repeated writes of the same key to one line.
+    let (tmp, git) = repo();
+    let cfg = config("true");
+    let (name, check) = check_of(&cfg);
+
+    for _ in 0..5 {
+        let mut store = JsonStore::open(&git.state_dir()).unwrap();
+        run_check(&git, &cfg, name, check, &mut store, false).unwrap(); // no_cache: re-run each time
+    }
+    let log = git.state_dir().join("verdicts.jsonl");
+    let before = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(before.lines().count(), 5, "each put appends one line");
+
+    // The verdict is still readable after all those reopens.
+    let store = JsonStore::open(&git.state_dir()).unwrap();
+    let tree = snapshot(&git, &cfg).unwrap();
+    let key = greentree::cache::VerdictKey {
+        tree,
+        check: name.to_string(),
+        check_hash: check.hash(),
+        env_fingerprint: greentree::config::env_fingerprint(&git.root, &cfg.inputs)
+            .unwrap()
+            .0,
+    };
+    assert!(store.get(&key).is_some());
+
+    greentree::gc::gc(&git, &greentree::gc::GcOptions::default()).unwrap();
+    let after = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(after.lines().count(), 1, "gc compacts to one line per key");
+    let _ = tmp;
+}
+
+#[test]
 fn check_cannot_read_the_github_token() {
     // The check subprocess must never see greentree's credentials, so that
     // running verification can never leak the token that attests it.

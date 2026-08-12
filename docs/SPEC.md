@@ -59,8 +59,11 @@ Verdict record fields (JSON, `schema_version: 1`): `tree`, `check`,
 `greentree_version`, `snapshot_ref`, `log_path`, `log_bytes`, `log_digest`,
 `log_truncated`.
 
-The store is machine-local and advisory. It is not a tamper-proof
-attestation.
+The store is an append-only JSONL log at `<git-dir>/greentree/verdicts.jsonl`
+(one record per line, last line wins per key, loaded into memory on open).
+A write appends one line, so it stays O(one verdict) no matter how many
+have accumulated; `gc` compacts the log to one line per live key. The
+store is machine-local and advisory, not a tamper-proof attestation.
 
 ### Publish
 
@@ -116,7 +119,8 @@ Semantics:
 anchors beyond the newest N or older than the TTL (defaults 50 / 14d), and
 trims logs oldest-first to the byte budget (default 256 MB). Deleting an
 anchor unpins objects; disk returns at the repository's next `git gc`.
-Verdicts are never pruned — they are tree-keyed and stay valid without
+gc also compacts the verdict log to one line per live key. Verdicts
+themselves are never pruned — they are tree-keyed and stay valid without
 their anchor.
 
 ### GitHub statuses (v0.3)

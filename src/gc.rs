@@ -46,6 +46,10 @@ pub fn gc(git: &Git, opts: &GcOptions) -> Result<GcReport> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Compact the append-only verdict log to one line per live key, so
+    // repeated `test` runs of the same check don't grow it without bound.
+    crate::cache::JsonStore::open(&git.state_dir())?.compact()?;
+
     // Snapshot anchors, newest first.
     let refs = git.run([
         "for-each-ref",
