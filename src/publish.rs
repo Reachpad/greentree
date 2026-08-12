@@ -218,7 +218,7 @@ pub fn publish(
     })
 }
 
-/// The verification gate, shared by publish, attest, and serve: every
+/// The verification gate, shared by publish and attest: every
 /// required check must hold a passing verdict for exactly `tree`, fresh
 /// within its window, under the CURRENT environment fingerprint. Returns
 /// the check names that verified.

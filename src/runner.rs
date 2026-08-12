@@ -140,11 +140,11 @@ pub fn run_check_with(
     for var in GIT_ENV_OVERRIDES {
         cmd.env_remove(var); // our shadow index must never leak into the check
     }
-    // Never expose greentree's own credentials to a check. `serve` runs
-    // commit-supplied `run:` code with a status token in its environment; a
-    // check must not be able to read it. Scrubbed everywhere (test/gate/
-    // watch too) so the guarantee does not depend on how greentree was
-    // invoked. The token reaches only the ureq POST in github.rs.
+    // Never expose greentree's own credentials to a check: `attest` posts
+    // statuses with a token in greentree's environment, and a check must
+    // not be able to read it. Scrubbed unconditionally so the guarantee
+    // never depends on how greentree was invoked. The token reaches only
+    // the ureq POST in github.rs.
     for var in crate::TOKEN_ENVS {
         cmd.env_remove(var);
     }
@@ -236,8 +236,8 @@ pub fn run_check_with(
     };
     // The direct child is reaped, but a backgrounded grandchild may still
     // hold the pipes (`npm run dev &`) or may have detached its stdio (a
-    // daemon), which would otherwise survive the run and — under serve —
-    // contaminate the next commit's checkout. Give any pipe-holders a short
+    // daemon), which would otherwise survive the run and leak resources or
+    // hold ports across later runs. Give any pipe-holders a short
     // window to flush, then ALWAYS kill the whole process group: nothing a
     // check spawns is allowed to outlive it.
     let drain_deadline = Instant::now() + Duration::from_millis(500);

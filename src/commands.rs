@@ -394,7 +394,7 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
 
 /// Post statuses for HEAD if its tree is verified. The half of the loop
 /// that lets a NORMAL `git push` end attested: verify while working, push
-/// with plain git, then attest (locally or from `serve`).
+/// with plain git, then attest.
 #[cfg(not(feature = "github"))]
 fn attest(_cli: &Cli, _git: &Git) -> crate::Result<u8> {
     Err(Error::Config(

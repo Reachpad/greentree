@@ -72,9 +72,8 @@ pub struct StatusEntry {
 }
 
 /// Post one `greentree/<check>` status per entry on the commit. `publish`
-/// and `attest` only ever post successes (unverified trees are refused
-/// before this point); `serve` reports real outcomes, because a failing
-/// pushed commit deserves a red X, not silence. Returns contexts posted.
+/// and `attest` only ever post successes: unverified trees are refused
+/// before this point. Returns the contexts posted.
 pub fn post_entries(git: &Git, commit: &str, entries: &[StatusEntry]) -> Result<Vec<String>> {
     let token = token_from_env().ok_or_else(|| {
         Error::Publish("no GREENTREE_GITHUB_TOKEN or GITHUB_TOKEN in the environment".into())
