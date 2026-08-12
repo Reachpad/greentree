@@ -62,40 +62,6 @@ fn dispatch(cli: &Cli, dir: &Path) -> crate::Result<u8> {
         }
         Command::Gate { push, message } => gate(cli, &git, *push, message.clone()),
         Command::Attest => attest(cli, &git),
-        Command::Serve {
-            remote,
-            branch,
-            interval,
-            once,
-        } => {
-            let branch = match branch {
-                Some(b) => b.clone(),
-                None => {
-                    let out = git.run_unchecked(["symbolic-ref", "-q", "--short", "HEAD"])?;
-                    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if b.is_empty() {
-                        return Err(Error::Config(
-                            "HEAD is detached; pass --branch explicitly".into(),
-                        ));
-                    }
-                    b
-                }
-            };
-            let interval = humantime::parse_duration(interval)
-                .map_err(|e| Error::Config(format!("invalid interval {interval:?}: {e}")))?
-                .max(std::time::Duration::from_secs(5));
-            crate::serve::serve(
-                &git,
-                &crate::serve::ServeOptions {
-                    remote: remote.clone(),
-                    branch,
-                    interval,
-                    once: *once,
-                    json: cli.json,
-                },
-            )?;
-            Ok(exit::OK)
-        }
         Command::Watch { once } => {
             crate::watch::watch(
                 &git,

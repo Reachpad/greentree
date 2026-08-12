@@ -136,7 +136,6 @@ its conventional test command.
 | `gate` | `test` for required checks, then `publish` if green; idempotent |
 | `watch` | Reruns watch-marked checks on every settle; kills runs on edit |
 | `attest` | Posts `greentree/<check>` statuses for HEAD if its tree is verified |
-| `serve` | Polls a remote and verifies each new commit in a warm clone; posts outcomes |
 | `gc` | Prunes snapshot anchors and trims logs |
 
 Every command takes `--json` (exactly one JSON object on stdout) and
@@ -221,44 +220,34 @@ greentree gate --json -m "<message>"
 snippet and a Claude Code hook that blocks `git commit`/`git push` so the
 gate is the only door.
 
-### As the CI: a warm runner instead of a cold one
+### The gate before GitHub
 
-A cold runner re-derives everything per push: clone, toolchain,
-dependencies, full test run. `greentree serve` replaces it with a
-dedicated clone on any machine that stays on (a [reachpad](https://reachpad.dev)
-workspace, a spare VPS, the box you already develop on):
+greentree verifies where you work, before the push. GitHub records the
+result and enforces it, running no builds of its own:
 
-```sh
-git clone https://github.com/you/your-repo runner && cd runner
-GITHUB_TOKEN=... greentree serve --branch main
-```
+1. Verify while you work (`test`/`watch`/`gate`), in the workspace that
+   already has the checkout and warm caches.
+2. Land the commit, either with `greentree gate --push` (builds the commit
+   from the verified tree and pushes) or with plain `git commit && git
+   push` followed by `greentree attest`.
+3. Both paths post a `greentree/<check>` commit status on the pushed SHA.
+4. A GitHub branch-protection rule that requires that status turns it into
+   a merge gate. GitHub runs nothing; it checks that the box is green.
 
-serve polls the remote, checks each new commit out into the warm working
-copy (incremental build caches and ignored dirs survive between runs),
-verifies it, and posts one `greentree/<check>` status per outcome,
-failures included. Content already verified anywhere the clone has seen
-it (rebases, reverts, message rewrites) is a tree-hash cache hit and
-re-attests in seconds. Push from a laptop, an agent, anywhere: the warm
-clone is the runner.
+A commit that never went through a workspace has no status and cannot
+merge. To get green, route it through verification. That is the whole
+enforcement, with zero CI minutes.
 
-Three ways a commit ends up attested, all landing the same status:
+greentree posts statuses with a GitHub token from the environment
+(`GREENTREE_GITHUB_TOKEN` or `GITHUB_TOKEN`). Checks never see it: the
+token is scrubbed from every check subprocess and reaches only the status
+API call. Use a fine-grained token scoped to the repo with "Commit
+statuses: write".
 
-| flow | who verifies | runner minutes |
-|---|---|---|
-| `greentree gate --push` | your workspace, before the push | none |
-| plain `git push`, serve running | the warm runner clone | none (your machine) |
-| plain `git push` + `greentree attest` | your workspace, after the push | none |
-
-The composite action remains as the cold-isolation fallback, mainly for
-pull requests from forks, where you want an ephemeral runner for
-untrusted code:
-
-```yaml
-- uses: actions/checkout@v4
-- uses: reachpad/greentree/action@main
-  # with:
-  #   fresh: "true"   # distrust restored verdicts; always re-run
-```
+Verification runs wherever you invoke greentree. Pointing it at a
+persistent warm workspace instead of the local machine, so the cache and
+environment are shared and authoritative, is on the [roadmap](docs/ROADMAP.md);
+[reachpad](https://reachpad.dev) is that workspace.
 
 ## Comparisons
 
@@ -320,8 +309,13 @@ Stated here because a verification tool that oversells is worse than none:
 
 - The verdict cache is machine-local and advisory. It attests that this
   tree passed on this machine, not a tamper-proof supply chain proof.
-- `run:` commands come from repo config and execute with your privileges,
-  the same trust model as `npm test` or `make`.
+- `run:` commands come from repo config and execute on the machine that
+  runs greentree, with your privileges: the same trust model as `npm test`
+  or `make`. greentree verifies code you already trust (your own work,
+  your agents), before it is pushed. It is not a sandbox for untrusted
+  code, and it does not pull in and run other people's commits. Verifying
+  untrusted contributions (fork pull requests) is a job for an isolated,
+  ephemeral runner, not greentree.
 - Undeclared environment (toolchain versions, system libraries) is not in
   the verdict key. Declare what matters in `inputs:`.
 - An edit-and-revert during a single check run (ABA) is undetectable until
