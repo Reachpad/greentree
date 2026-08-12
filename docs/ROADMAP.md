@@ -11,16 +11,17 @@ milestone after it stays small and composes with the last.
 - `greentree gc`: snapshot-ref retention (keep-last-N + TTL), log budget.
 - (Deferred: sqlite store — the flock still serializes all writers.)
 
-## v0.3 — GitHub statuses
+## v0.3 — GitHub statuses (shipped)
 
 - `publish --push` posts a `greentree/<check>` commit status on the pushed
-  SHA (PAT: classic `repo:status` or fine-grained "Commit statuses" RW).
-  Statuses satisfy branch-protection required checks; the Checks API is
-  GitHub-App-only and comes later.
-- `greentree-action`: a thin GitHub Action that restores `.git/greentree`
+  SHA (PAT: classic `repo:status` or fine-grained "Commit statuses" RW);
+  best-effort and idempotent. Statuses satisfy branch-protection required
+  checks; the Checks API is GitHub-App-only and comes later.
+- `action/`: a composite GitHub Action that restores `.git/greentree`
   from actions/cache and runs `greentree test --json` — the GitHub-side
   required check for teams that won't trust workspace-posted statuses, with
-  tree-keyed cache hits for already-verified content.
+  tree-keyed cache hits for already-verified content (`fresh: "true"` to
+  always re-run).
 
 ## v0.4 — worktree executor
 

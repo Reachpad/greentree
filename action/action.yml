@@ -1,0 +1,49 @@
+name: greentree
+description: >-
+  Verify the tree with content-addressed verdicts: checks are skipped for
+  trees already verified (locally or in a previous run), re-run otherwise.
+branding:
+  icon: git-commit
+  color: green
+
+inputs:
+  check:
+    description: Run a single named check (default runs every configured check).
+    required: false
+    default: ""
+  fresh:
+    description: Ignore restored verdicts and re-run checks ("true"/"false").
+    required: false
+    default: "false"
+  version:
+    description: greentree git rev to install when not already on PATH.
+    required: false
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - name: Restore verdict cache
+      uses: actions/cache@v4
+      with:
+        path: .git/greentree
+        key: greentree-${{ runner.os }}-${{ github.sha }}
+        restore-keys: |
+          greentree-${{ runner.os }}-
+
+    - name: Install greentree
+      shell: bash
+      run: |
+        if ! command -v greentree >/dev/null 2>&1; then
+          cargo install --locked \
+            --git https://github.com/reachpad/greentree \
+            --rev "${{ inputs.version }}" greentree
+        fi
+
+    - name: Verify tree
+      shell: bash
+      run: |
+        args=(test --json)
+        if [ -n "${{ inputs.check }}" ]; then args+=("${{ inputs.check }}"); fi
+        if [ "${{ inputs.fresh }}" = "true" ]; then args+=(--no-cache); fi
+        greentree "${args[@]}"
