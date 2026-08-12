@@ -340,9 +340,17 @@ fn cancel_flag_kills_run_and_nothing_is_cached() {
         })
     };
     let started = std::time::Instant::now();
-    let r =
-        greentree::runner::run_check_with(&git, &cfg, name, check, &mut store, true, Some(&cancel))
-            .unwrap();
+    let r = greentree::runner::run_check_with(
+        &git,
+        &cfg,
+        name,
+        check,
+        &mut store,
+        true,
+        Some(&cancel),
+        None,
+    )
+    .unwrap();
     setter.join().unwrap();
 
     assert_eq!(r.verdict.outcome, Outcome::Cancelled);
@@ -438,6 +446,212 @@ fn watch_once_verifies_a_settling_tree() {
         !git.state_dir().join("watch.pid").exists(),
         "pidfile removed on exit"
     );
+}
+
+#[test]
+fn resume_path_still_requires_verification() {
+    // A leftover journal must never bypass the gate: same setup as the
+    // resume test, but the store holds NO verdict for the tree.
+    let (tmp, git) = repo();
+    let cfg = config("true");
+    let store = JsonStore::open(&git.state_dir()).unwrap();
+    sh(tmp.path(), "echo v > f.txt");
+    let tree = snapshot(&git, &cfg).unwrap();
+
+    let parent = sh(tmp.path(), "git rev-parse HEAD");
+    let commit = sh(
+        tmp.path(),
+        &format!("git commit-tree {tree} -p {parent} -m 'interrupted'"),
+    );
+    sh(
+        tmp.path(),
+        &format!("git update-ref refs/heads/main {commit} {parent}"),
+    );
+    let journal = serde_json::json!({
+        "schema_version": 1, "tree": tree, "branch": "main", "parent": parent,
+        "change_id": "deadbeefdeadbeefdeadbeefdeadbeef", "new_commit": commit, "lease": null,
+    });
+    std::fs::create_dir_all(git.state_dir()).unwrap();
+    std::fs::write(
+        git.state_dir().join("publish-journal.json"),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+
+    match publish(&git, &cfg, &store, &PublishOptions::default()) {
+        Err(Error::NotVerified { .. }) => {}
+        other => panic!("journal bypassed the gate: {other:?}"),
+    }
+}
+
+#[test]
+fn resume_on_wrong_branch_is_refused() {
+    let (tmp, git) = repo();
+    let cfg = config("true");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    sh(tmp.path(), "echo v > f.txt");
+    let (name, check) = check_of(&cfg);
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    let tree = r.verdict.tree.clone();
+
+    let parent = sh(tmp.path(), "git rev-parse HEAD");
+    let commit = sh(
+        tmp.path(),
+        &format!("git commit-tree {tree} -p {parent} -m x"),
+    );
+    sh(
+        tmp.path(),
+        &format!("git update-ref refs/heads/main {commit} {parent}"),
+    );
+    let journal = serde_json::json!({
+        "schema_version": 1, "tree": tree, "branch": "main", "parent": parent,
+        "change_id": "deadbeefdeadbeefdeadbeefdeadbeef", "new_commit": commit, "lease": null,
+    });
+    std::fs::write(
+        git.state_dir().join("publish-journal.json"),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    sh(tmp.path(), "git checkout -qb other && git reset -q");
+
+    match publish(&git, &cfg, &store, &PublishOptions::default()) {
+        Err(Error::Publish(msg)) => assert!(msg.contains("branch"), "wrong error: {msg}"),
+        other => panic!("resume crossed branches: {other:?}"),
+    }
+}
+
+#[test]
+fn corrupt_journal_fails_loudly() {
+    let (tmp, git) = repo();
+    let cfg = config("true");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    sh(tmp.path(), "echo v > f.txt");
+    let (name, check) = check_of(&cfg);
+    run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    std::fs::write(git.state_dir().join("publish-journal.json"), b"{garbage").unwrap();
+    match publish(&git, &cfg, &store, &PublishOptions::default()) {
+        Err(Error::Publish(msg)) => assert!(msg.contains("parse"), "wrong error: {msg}"),
+        other => panic!("corrupt journal was swallowed: {other:?}"),
+    }
+}
+
+#[test]
+fn backgrounded_grandchild_does_not_hang_the_run() {
+    let (_tmp, git) = repo();
+    let cfg = config("sleep 20 & exit 0");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+    let started = std::time::Instant::now();
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    assert_eq!(r.verdict.outcome, Outcome::Pass);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "drain join blocked on the backgrounded process's pipe: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn push_lease_works_with_non_origin_remote() {
+    let (tmp, git) = repo();
+    let remote_dir = TempDir::new().unwrap();
+    sh(remote_dir.path(), "git init -q --bare -b main");
+    sh(
+        tmp.path(),
+        &format!("git remote add upstream {}", remote_dir.path().display()),
+    );
+
+    let cfg = config("true");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    sh(tmp.path(), "echo one > f.txt");
+    let (name, check) = check_of(&cfg);
+    run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    let first = publish(
+        &git,
+        &cfg,
+        &store,
+        &PublishOptions {
+            push: true,
+            message: None,
+        },
+    )
+    .unwrap();
+    assert!(first.pushed);
+
+    // Second publish: the remote-tracking ref now exists — the lease must
+    // be read for the remote we push to, not a hardcoded `origin`.
+    sh(tmp.path(), "echo two > f.txt");
+    run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    let second = publish(
+        &git,
+        &cfg,
+        &store,
+        &PublishOptions {
+            push: true,
+            message: None,
+        },
+    )
+    .unwrap();
+    assert!(second.pushed);
+    let remote_head = sh(remote_dir.path(), "git rev-parse main");
+    assert_eq!(Some(remote_head), second.commit);
+}
+
+#[test]
+fn colliding_check_names_get_distinct_logs() {
+    let (_tmp, git) = repo();
+    let mut checks = IndexMap::new();
+    for (name, run) in [("a.b", "echo FROM-DOT; false"), ("a b", "echo FROM-SPACE")] {
+        checks.insert(
+            name.to_string(),
+            Check {
+                run: run.to_string(),
+                required_for_publish: false,
+                fresh: None,
+                timeout: None,
+                watch: false,
+            },
+        );
+    }
+    let cfg = Config {
+        version: 1,
+        checks,
+        snapshot: Default::default(),
+        inputs: Vec::new(),
+    };
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let dot = run_check(&git, &cfg, "a.b", &cfg.checks["a.b"], &mut store, true).unwrap();
+    let space = run_check(&git, &cfg, "a b", &cfg.checks["a b"], &mut store, true).unwrap();
+    assert_ne!(
+        dot.verdict.log_path, space.verdict.log_path,
+        "sanitized names collided onto one log file"
+    );
+    assert!(dot.log_tail.contains("FROM-DOT"), "{}", dot.log_tail);
+    assert!(space.log_tail.contains("FROM-SPACE"), "{}", space.log_tail);
+}
+
+#[test]
+fn directory_inputs_are_fingerprinted() {
+    let (tmp, git) = repo();
+    let mut cfg = config("true");
+    cfg.inputs = vec!["conf".into()];
+    sh(
+        tmp.path(),
+        "mkdir conf && echo A=1 > conf/x.env && echo conf/ > .gitignore",
+    );
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = ("test".to_string(), cfg.checks.get("test").unwrap().clone());
+    let r1 = run_check(&git, &cfg, &name, &check, &mut store, true).unwrap();
+    assert!(
+        r1.verdict.env_inputs.keys().any(|k| k.contains("x.env")),
+        "directory input contributed nothing: {:?}",
+        r1.verdict.env_inputs
+    );
+    let r2 = run_check(&git, &cfg, &name, &check, &mut store, true).unwrap();
+    assert!(r2.cached);
+    sh(tmp.path(), "echo A=2 > conf/x.env");
+    let r3 = run_check(&git, &cfg, &name, &check, &mut store, true).unwrap();
+    assert!(!r3.cached, "edit inside a directory input must invalidate");
 }
 
 // ---- exit-code contract through the real binary ----

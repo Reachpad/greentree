@@ -12,7 +12,7 @@ use crate::cli::{Cli, Command};
 use crate::config::{Config, CONFIG_FILE};
 use crate::git::Git;
 use crate::publish::{load_journal, publish, PublishOptions};
-use crate::runner::{run_check, short, RunResult};
+use crate::runner::{short, RunResult};
 use crate::snapshot::snapshot;
 use crate::{exit, lock, Error};
 
@@ -165,9 +165,16 @@ fn test(cli: &Cli, git: &Git, only: Option<&str>, no_cache: bool) -> crate::Resu
             .collect(),
     };
 
+    // Thread the tree hash through the run: each check's after-hash is the
+    // next check's before-hash, so an unchanged tree is hashed once, not
+    // once per check.
     let mut results: Vec<(String, RunResult)> = Vec::new();
+    let mut pre_tree: Option<String> = None;
     for (name, check) in &selected {
-        let r = run_check(git, &cfg, name, check, &mut store, !no_cache)?;
+        let r = crate::runner::run_check_with(
+            git, &cfg, name, check, &mut store, !no_cache, None, pre_tree,
+        )?;
+        pre_tree = Some(r.tree_after.clone());
         results.push((name.clone(), r));
     }
 
@@ -175,15 +182,21 @@ fn test(cli: &Cli, git: &Git, only: Option<&str>, no_cache: bool) -> crate::Resu
         .iter()
         .map(|(_, r)| r.verdict.outcome)
         .fold(Outcome::Pass, worse);
+    // `ok` promises "this tree is verified" — it must not be true when the
+    // verdicts span different trees (an edit between checks).
+    let consistent = results
+        .windows(2)
+        .all(|w| w[0].1.verdict.tree == w[1].1.verdict.tree);
 
     if cli.json {
         println!(
             "{}",
             json!({
-                "tree": results.first().map(|(_, r)| r.verdict.tree.clone()),
-                "ok": worst == Outcome::Pass,
+                "tree": results.last().map(|(_, r)| r.tree_after.clone()),
+                "ok": worst == Outcome::Pass && consistent,
                 "results": results.iter().map(|(name, r)| json!({
                     "check": name,
+                    "tree": r.verdict.tree,
                     "outcome": r.verdict.outcome.as_str(),
                     "cached": r.cached,
                     "exit_code": r.verdict.exit_code,
@@ -205,18 +218,8 @@ fn test(cli: &Cli, git: &Git, only: Option<&str>, no_cache: bool) -> crate::Resu
                     format!(" ({:.1}s)", r.verdict.duration_ms as f64 / 1000.0)
                 }
             );
-            if r.verdict.outcome != Outcome::Pass && !r.log_tail.is_empty() {
-                for line in r
-                    .log_tail
-                    .lines()
-                    .rev()
-                    .take(15)
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .rev()
-                {
-                    println!("    {line}");
-                }
+            if r.verdict.outcome != Outcome::Pass {
+                print_tail(&r.log_tail);
             }
         }
     }
@@ -229,7 +232,9 @@ fn test(cli: &Cli, git: &Git, only: Option<&str>, no_cache: bool) -> crate::Resu
 }
 
 fn status(cli: &Cli, git: &Git) -> crate::Result<u8> {
-    let _lock = lock::acquire(&git.state_dir())?;
+    // status is what agents poll while a check runs — wait briefly for the
+    // lock instead of failing with exit 13 during every cycle.
+    let _lock = lock::acquire_wait(&git.state_dir(), std::time::Duration::from_secs(3))?;
     let cfg = Config::effective(&git.root)?;
     let store = JsonStore::open(&git.state_dir())?;
     let tree = snapshot(git, &cfg)?;
@@ -327,8 +332,12 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
     let mut store = JsonStore::open(&git.state_dir())?;
 
     let mut results: Vec<(String, RunResult)> = Vec::new();
+    let mut pre_tree: Option<String> = None;
     for (name, check) in cfg.required_checks() {
-        let r = run_check(git, &cfg, name, check, &mut store, true)?;
+        let r = crate::runner::run_check_with(
+            git, &cfg, name, check, &mut store, true, None, pre_tree,
+        )?;
+        pre_tree = Some(r.tree_after.clone());
         let outcome = r.verdict.outcome;
         results.push((name.clone(), r));
         if outcome != Outcome::Pass {
@@ -339,6 +348,7 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
                     json!({
                         "gate": "refused",
                         "check": name,
+                        "tree": r.verdict.tree,
                         "outcome": r.verdict.outcome.as_str(),
                         "log": r.verdict.log_path,
                         "log_tail": r.log_tail,
@@ -346,17 +356,7 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
                 );
             } else {
                 println!("gate refused: {name} {}", mark(r.verdict.outcome));
-                for line in r
-                    .log_tail
-                    .lines()
-                    .rev()
-                    .take(15)
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .rev()
-                {
-                    println!("    {line}");
-                }
+                print_tail(&r.log_tail);
             }
             return Ok(match outcome {
                 Outcome::Fail => exit::CHECK_FAILED,
@@ -373,11 +373,13 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
             json!({
                 "gate": "published",
                 "checks": results.iter().map(|(name, r)| json!({
-                    "check": name, "cached": r.cached,
+                    "check": name,
+                    "tree": r.verdict.tree,
+                    "outcome": r.verdict.outcome.as_str(),
+                    "cached": r.cached,
+                    "duration_ms": r.verdict.duration_ms,
                 })).collect::<Vec<_>>(),
-                "publish": serde_json::to_value(&report)?,
-                "statuses_posted": statuses.0,
-                "statuses_error": statuses.1,
+                "publish": publish_json(&report, &statuses),
             })
         );
     } else {
@@ -389,31 +391,64 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
     Ok(exit::OK)
 }
 
+/// Statuses outcome of a pushed publish, flattened into the publish JSON.
+#[derive(Default, serde::Serialize)]
+struct Statuses {
+    #[serde(rename = "statuses_posted")]
+    posted: Vec<String>,
+    #[serde(rename = "statuses_error")]
+    error: Option<String>,
+}
+
+fn publish_json(report: &crate::publish::PublishReport, statuses: &Statuses) -> serde_json::Value {
+    let mut value = serde_json::to_value(report).expect("report serializes");
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("statuses_posted".into(), json!(statuses.posted));
+        obj.insert("statuses_error".into(), json!(statuses.error));
+    }
+    value
+}
+
+fn print_tail(log_tail: &str) {
+    for line in log_tail
+        .lines()
+        .rev()
+        .take(15)
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+    {
+        println!("    {line}");
+    }
+}
+
 /// Post `greentree/<check>` statuses after a pushed publish — best-effort:
 /// skipped silently without a token or a github.com remote; a failed post
 /// warns instead of failing the publish (rerun `publish --push` to re-post;
 /// same context overwrites).
+#[cfg(feature = "github")]
 fn maybe_post_statuses(
     git: &Git,
     cfg: &Config,
     report: &crate::publish::PublishReport,
-) -> (Vec<String>, Option<String>) {
+) -> Statuses {
     if !report.pushed {
-        return (Vec::new(), None);
+        return Statuses::default();
     }
     let Some(commit) = &report.commit else {
-        return (Vec::new(), None);
+        return Statuses::default();
     };
     if crate::github::token_from_env().is_none() {
         tracing::debug!("no GitHub token in env; skipping status posting");
-        return (Vec::new(), None);
+        return Statuses::default();
     }
     match crate::github::remote_url(git) {
         Some(url) if crate::github::parse_github_remote(&url).is_some() => {}
-        _ => return (Vec::new(), None),
+        _ => return Statuses::default(),
     }
-    // A resumed publish carries no re-verified list; the gate held earlier,
-    // so post for every required check.
+    // The gate always runs before publish (including resumes); post for the
+    // checks it verified, or every required check when the report predates
+    // this run's verification list.
     let checks: Vec<String> = if report.verified_by.is_empty() {
         cfg.required_checks()
             .into_iter()
@@ -423,26 +458,32 @@ fn maybe_post_statuses(
         report.verified_by.clone()
     };
     match crate::github::post_statuses(git, commit, &report.tree, &checks) {
-        Ok(posted) => (posted, None),
+        Ok(posted) => Statuses {
+            posted,
+            error: None,
+        },
         Err(e) => {
             tracing::warn!(error = %e, "status posting failed (publish itself succeeded)");
-            (Vec::new(), Some(e.to_string()))
+            Statuses {
+                posted: Vec::new(),
+                error: Some(e.to_string()),
+            }
         }
     }
 }
 
-fn emit_publish(
-    cli: &Cli,
-    report: &crate::publish::PublishReport,
-    statuses: &(Vec<String>, Option<String>),
-) {
+#[cfg(not(feature = "github"))]
+fn maybe_post_statuses(
+    _git: &Git,
+    _cfg: &Config,
+    _report: &crate::publish::PublishReport,
+) -> Statuses {
+    Statuses::default()
+}
+
+fn emit_publish(cli: &Cli, report: &crate::publish::PublishReport, statuses: &Statuses) {
     if cli.json {
-        let mut value = serde_json::to_value(report).expect("report serializes");
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("statuses_posted".into(), json!(statuses.0));
-            obj.insert("statuses_error".into(), json!(statuses.1));
-        }
-        println!("{value}");
+        println!("{}", publish_json(report, statuses));
     } else if report.noop {
         println!(
             "tree {} already committed at HEAD{}",

@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod gc;
 pub mod git;
+#[cfg(feature = "github")]
 pub mod github;
 pub mod lock;
 pub mod publish;

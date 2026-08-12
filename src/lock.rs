@@ -21,3 +21,17 @@ pub fn acquire(state_dir: &std::path::Path) -> Result<Lock> {
         Err((_, errno)) => Err(Error::Io(std::io::Error::from(errno))),
     }
 }
+
+/// Acquire, waiting up to `timeout` for a holder to finish. Used by verbs an
+/// agent polls (`status`) so a running check doesn't turn into exit 13.
+pub fn acquire_wait(state_dir: &std::path::Path, timeout: std::time::Duration) -> Result<Lock> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match acquire(state_dir) {
+            Err(Error::LockHeld) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}

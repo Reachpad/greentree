@@ -37,6 +37,10 @@ pub struct RunResult {
     pub cached: bool,
     /// Last portion of the check's output, for direct reporting.
     pub log_tail: String,
+    /// The tree hash observed after the run — callers running several
+    /// checks pass it as the next check's `pre_tree` to avoid re-hashing
+    /// an unchanged tree.
+    pub tree_after: String,
 }
 
 pub fn run_check(
@@ -47,12 +51,14 @@ pub fn run_check(
     store: &mut dyn VerdictStore,
     use_cache: bool,
 ) -> Result<RunResult> {
-    run_check_with(git, cfg, name, check, store, use_cache, None)
+    run_check_with(git, cfg, name, check, store, use_cache, None, None)
 }
 
-/// Like [`run_check`], with an external cancel flag: when set (the watcher
-/// saw an edit), the check's process group is killed immediately — its
-/// verdict could never be cached anyway.
+/// Like [`run_check`], with an external cancel flag (when set — the watcher
+/// saw an edit — the check's process group is killed immediately; its
+/// verdict could never be cached anyway) and an optional pre-computed tree
+/// hash from the caller's previous check.
+#[allow(clippy::too_many_arguments)]
 pub fn run_check_with(
     git: &Git,
     cfg: &Config,
@@ -61,8 +67,12 @@ pub fn run_check_with(
     store: &mut dyn VerdictStore,
     use_cache: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    pre_tree: Option<String>,
 ) -> Result<RunResult> {
-    let tree = snapshot(git, cfg)?;
+    let tree = match pre_tree {
+        Some(t) => t,
+        None => snapshot(git, cfg)?,
+    };
     let (env_fp, env_inputs) = env_fingerprint(&git.root, &cfg.inputs)?;
     let key = VerdictKey {
         tree: tree.clone(),
@@ -79,6 +89,7 @@ pub fn run_check_with(
                 verdict: v,
                 cached: true,
                 log_tail,
+                tree_after: tree,
             });
         }
     }
@@ -93,12 +104,30 @@ pub fn run_check_with(
 
     let log_dir = git.state_dir().join("logs");
     std::fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!(
-        "{}-{}-{}.log",
+    // O_EXCL + counter suffix: sanitize() maps distinct check names onto the
+    // same stem, and same-second reruns exist — a verdict must never point
+    // at another run's log.
+    let base = format!(
+        "{}-{}-{}",
         short(&tree),
         sanitize(name),
         unix_secs(started_at)
-    ));
+    );
+    let (log_file, log_path) = {
+        let mut attempt = 0u32;
+        loop {
+            let candidate = if attempt == 0 {
+                log_dir.join(format!("{base}.log"))
+            } else {
+                log_dir.join(format!("{base}.{attempt}.log"))
+            };
+            match std::fs::File::create_new(&candidate) {
+                Ok(f) => break (f, candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
 
     let mut cmd = Command::new(SHELL);
     cmd.arg("-c")
@@ -138,15 +167,17 @@ pub fn run_check_with(
                 blake3::Hasher::new(),
                 false,
             );
+            let tree_after = tree.clone();
             return Ok(RunResult {
                 verdict: v,
                 cached: false,
                 log_tail: format!("failed to spawn {SHELL}: {e}"),
+                tree_after,
             });
         }
     };
 
-    let sink = Arc::new(Mutex::new(LogSink::new(&log_path)?));
+    let sink = Arc::new(Mutex::new(LogSink::new(log_file)));
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let t_out = drain(stdout, Arc::clone(&sink));
@@ -195,7 +226,23 @@ pub fn run_check_with(
         }
         std::thread::sleep(POLL);
     };
-    // Reap any stragglers still holding the pipes, then finish draining.
+    // The direct child is reaped, but a backgrounded grandchild that
+    // inherited stdout/stderr keeps the pipes open — an unconditional join
+    // would hang forever (`npm run dev &` in a check). Give the drains a
+    // short window, then kill the whole group so the pipes reach EOF.
+    let drain_deadline = Instant::now() + Duration::from_millis(500);
+    while !(t_out.is_finished() && t_err.is_finished()) {
+        if Instant::now() >= drain_deadline {
+            tracing::warn!(
+                check = name,
+                "output pipes still open after check exit (backgrounded \
+                 process?); killing the process group"
+            );
+            let _ = killpg(pgid, Signal::SIGKILL);
+            break;
+        }
+        std::thread::sleep(POLL);
+    }
     let _ = t_out.join();
     let _ = t_err.join();
 
@@ -257,6 +304,7 @@ pub fn run_check_with(
         verdict,
         cached: false,
         log_tail: String::from_utf8_lossy(&log_tail_bytes).into_owned(),
+        tree_after,
     })
 }
 
@@ -317,14 +365,14 @@ struct LogSink {
 }
 
 impl LogSink {
-    fn new(path: &std::path::Path) -> Result<LogSink> {
-        Ok(LogSink {
-            file: std::fs::File::create(path)?,
+    fn new(file: std::fs::File) -> LogSink {
+        LogSink {
+            file,
             written: 0,
             total: 0,
             hasher: blake3::Hasher::new(),
             tail: VecDeque::with_capacity(TAIL_CAP),
-        })
+        }
     }
 
     fn write(&mut self, buf: &[u8]) {

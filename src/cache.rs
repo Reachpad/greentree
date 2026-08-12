@@ -126,22 +126,28 @@ impl Verdict {
 pub trait VerdictStore {
     fn get(&self, key: &VerdictKey) -> Option<Verdict>;
     fn put(&mut self, verdict: Verdict) -> Result<()>;
-    /// All verdicts for a tree (any check), newest first.
-    fn for_tree(&self, tree: &str) -> Vec<Verdict>;
 }
 
-/// v0.1 store: one JSON file under the global flock. Swapped for sqlite when
-/// the watch daemon introduces real concurrency; remote org caches implement
-/// the same trait.
+/// v0.x store: one JSON file under the global flock. Verdicts are held as
+/// raw JSON and deserialized only on a key hit, so lookups and writes stay
+/// O(one verdict) in parse cost even when thousands accumulate. Remote org
+/// caches implement the same trait.
 pub struct JsonStore {
     path: PathBuf,
-    verdicts: BTreeMap<String, Verdict>,
+    verdicts: BTreeMap<String, Box<serde_json::value::RawValue>>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Deserialize)]
 struct FileFormat {
+    #[allow(dead_code)]
     schema_version: u32,
-    verdicts: BTreeMap<String, Verdict>,
+    verdicts: BTreeMap<String, Box<serde_json::value::RawValue>>,
+}
+
+#[derive(Serialize)]
+struct FileFormatRef<'a> {
+    schema_version: u32,
+    verdicts: &'a BTreeMap<String, Box<serde_json::value::RawValue>>,
 }
 
 impl JsonStore {
@@ -157,12 +163,12 @@ impl JsonStore {
     }
 
     fn persist(&self) -> Result<()> {
-        let file = FileFormat {
+        let file = FileFormatRef {
             schema_version: VERDICT_SCHEMA_VERSION,
-            verdicts: self.verdicts.clone(),
+            verdicts: &self.verdicts,
         };
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
+        std::fs::write(&tmp, serde_json::to_vec(&file)?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -170,24 +176,16 @@ impl JsonStore {
 
 impl VerdictStore for JsonStore {
     fn get(&self, key: &VerdictKey) -> Option<Verdict> {
-        self.verdicts.get(&key.as_string()).cloned()
+        self.verdicts
+            .get(&key.as_string())
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
     }
 
     fn put(&mut self, verdict: Verdict) -> Result<()> {
         debug_assert!(verdict.outcome.cacheable(), "only pass/fail are cacheable");
-        self.verdicts.insert(verdict.key().as_string(), verdict);
+        let raw = serde_json::value::to_raw_value(&verdict)?;
+        self.verdicts.insert(verdict.key().as_string(), raw);
         self.persist()
-    }
-
-    fn for_tree(&self, tree: &str) -> Vec<Verdict> {
-        let mut v: Vec<_> = self
-            .verdicts
-            .values()
-            .filter(|x| x.tree == tree)
-            .cloned()
-            .collect();
-        v.sort_by_key(|x| std::cmp::Reverse(x.finished_unix));
-        v
     }
 }
 

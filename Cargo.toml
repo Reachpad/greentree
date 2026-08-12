@@ -1,6 +1,6 @@
 [package]
 name = "greentree"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -9,8 +9,13 @@ repository = "https://github.com/reachpad/greentree"
 keywords = ["git", "ci", "agents", "testing", "cache"]
 categories = ["development-tools", "command-line-utilities"]
 
+[features]
+default = ["github"]
+# GitHub commit-status posting. Off = no HTTP client, no TLS stack:
+# `cargo install greentree --no-default-features` builds the pure-git tool.
+github = ["dep:ureq"]
+
 [dependencies]
-anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
@@ -19,11 +24,11 @@ indexmap = { version = "2", features = ["serde"] }
 nix = { version = "0.29", features = ["signal", "fs"] }
 notify = "8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
 thiserror = "2"
 tracing = "0.1"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
