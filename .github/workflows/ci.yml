@@ -1,5 +1,11 @@
 name: ci
 
+# greentree's CI is greentree: the composite action installs the tool from
+# this checkout and runs `greentree test`, whose `full` check is the whole
+# gate (build + clippy + fmt + nextest + no-default-features + demo). The
+# verdict cache in .git/greentree is restored across runs, so a re-run on
+# content that already passed costs nothing.
+
 on:
   push:
     branches: [main]
@@ -20,5 +26,7 @@ jobs:
         with:
           tool: just,nextest
       - uses: Swatinem/rust-cache@v2
-      - run: just check
-      - run: just demo
+      - uses: ./action
+        with:
+          path: "."
+          check: full
