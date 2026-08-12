@@ -111,6 +111,23 @@ anchor unpins objects; disk returns at the repository's next `git gc`.
 Verdicts are never pruned — they are tree-keyed and stay valid without
 their anchor.
 
+### GitHub statuses (v0.3)
+
+After a pushed publish, greentree posts one commit status per verified
+check — context `greentree/<check>`, state `success`, description
+`verified tree <short-sha>` — on the pushed commit. Mechanics:
+
+- Token: `GREENTREE_GITHUB_TOKEN` or `GITHUB_TOKEN` (classic PAT needs
+  `repo:status`; fine-grained needs "Commit statuses" read/write). No
+  token, or a non-github.com remote → posting is silently skipped.
+- Statuses, not Check Runs: the Checks API is GitHub-App-only; statuses
+  work with a PAT and satisfy branch-protection required status checks
+  (match on the context string).
+- Best-effort: a failed post never fails the publish (`statuses_error` in
+  the JSON, warning on stderr). Rerunning `publish --push` re-posts; the
+  same context overwrites, so retries are idempotent.
+- Only `success` is ever posted — unverified trees never get pushed.
+
 ## Exit codes (stable contract)
 
 | code | meaning |
@@ -136,7 +153,7 @@ Errors in JSON mode print `{"error": "...", "exit_code": N}`. Shapes:
   checks: [{check, state, finished}], pending_publish}`
   where `state` ∈ `pass | fail | stale | missing | error | timeout | cancelled`
 - `publish`: `{tree, branch, noop, commit, change_id, pushed, resumed,
-  verified_by}`
+  verified_by, statuses_posted, statuses_error}`
 - `gate`: `{gate: "published", checks, publish}` or
   `{gate: "refused", check, outcome, log, log_tail}`
 - `init`: `{config_written, config_path, checks, tree}`

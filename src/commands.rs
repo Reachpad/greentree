@@ -56,7 +56,8 @@ fn dispatch(cli: &Cli, dir: &Path) -> crate::Result<u8> {
                     message: message.clone(),
                 },
             )?;
-            emit_publish(cli, &report);
+            let statuses = maybe_post_statuses(&git, &cfg, &report);
+            emit_publish(cli, &report, &statuses);
             Ok(exit::OK)
         }
         Command::Gate { push, message } => gate(cli, &git, *push, message.clone()),
@@ -365,6 +366,7 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
     }
 
     let report = publish(git, &cfg, &store, &PublishOptions { push, message })?;
+    let statuses = maybe_post_statuses(git, &cfg, &report);
     if cli.json {
         println!(
             "{}",
@@ -374,23 +376,73 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
                     "check": name, "cached": r.cached,
                 })).collect::<Vec<_>>(),
                 "publish": serde_json::to_value(&report)?,
+                "statuses_posted": statuses.0,
+                "statuses_error": statuses.1,
             })
         );
     } else {
         for (name, r) in &results {
             println!("  {name} ✓{}", if r.cached { " (cached)" } else { "" });
         }
-        emit_publish(cli, &report);
+        emit_publish(cli, &report, &statuses);
     }
     Ok(exit::OK)
 }
 
-fn emit_publish(cli: &Cli, report: &crate::publish::PublishReport) {
+/// Post `greentree/<check>` statuses after a pushed publish — best-effort:
+/// skipped silently without a token or a github.com remote; a failed post
+/// warns instead of failing the publish (rerun `publish --push` to re-post;
+/// same context overwrites).
+fn maybe_post_statuses(
+    git: &Git,
+    cfg: &Config,
+    report: &crate::publish::PublishReport,
+) -> (Vec<String>, Option<String>) {
+    if !report.pushed {
+        return (Vec::new(), None);
+    }
+    let Some(commit) = &report.commit else {
+        return (Vec::new(), None);
+    };
+    if crate::github::token_from_env().is_none() {
+        tracing::debug!("no GitHub token in env; skipping status posting");
+        return (Vec::new(), None);
+    }
+    match crate::github::remote_url(git) {
+        Some(url) if crate::github::parse_github_remote(&url).is_some() => {}
+        _ => return (Vec::new(), None),
+    }
+    // A resumed publish carries no re-verified list; the gate held earlier,
+    // so post for every required check.
+    let checks: Vec<String> = if report.verified_by.is_empty() {
+        cfg.required_checks()
+            .into_iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        report.verified_by.clone()
+    };
+    match crate::github::post_statuses(git, commit, &report.tree, &checks) {
+        Ok(posted) => (posted, None),
+        Err(e) => {
+            tracing::warn!(error = %e, "status posting failed (publish itself succeeded)");
+            (Vec::new(), Some(e.to_string()))
+        }
+    }
+}
+
+fn emit_publish(
+    cli: &Cli,
+    report: &crate::publish::PublishReport,
+    statuses: &(Vec<String>, Option<String>),
+) {
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string(report).expect("report serializes")
-        );
+        let mut value = serde_json::to_value(report).expect("report serializes");
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("statuses_posted".into(), json!(statuses.0));
+            obj.insert("statuses_error".into(), json!(statuses.1));
+        }
+        println!("{value}");
     } else if report.noop {
         println!(
             "tree {} already committed at HEAD{}",

@@ -109,7 +109,11 @@ conventional test command.
    changed are never cached.
 3. **Publish** — `git commit-tree <verified-tree> -p HEAD`, a
    compare-and-swap ref update, and (with `--push`) an explicit
-   `--force-with-lease` push. Every step is journaled: a publish killed at
+   `--force-with-lease` push, plus a `greentree/<check>` commit status on
+   the pushed SHA when a GitHub token is in the environment
+   (`GREENTREE_GITHUB_TOKEN`/`GITHUB_TOKEN`) — usable as a
+   branch-protection required check. A composite action
+   (`reachpad/greentree/action`) provides the CI-side re-check. Every step is journaled: a publish killed at
    any point resumes exactly where it stopped. Every commit carries a
    `Greentree-Change-Id` trailer — the stable identity that will let stacks
    of verified changes survive rebases (see ROADMAP).
