@@ -41,6 +41,9 @@ pub struct Check {
     /// Kill the check after this long. Default 15m.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// Run this check from `greentree watch` when the tree settles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub watch: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -139,6 +142,7 @@ impl Config {
                 required_for_publish: true,
                 fresh: None,
                 timeout: None,
+                watch: true,
             },
         );
         Some(Config {
@@ -147,6 +151,11 @@ impl Config {
             snapshot: SnapshotCfg::default(),
             inputs: Vec::new(),
         })
+    }
+
+    /// Checks `greentree watch` runs on each settle.
+    pub fn watch_checks(&self) -> Vec<(&String, &Check)> {
+        self.checks.iter().filter(|(_, c)| c.watch).collect()
     }
 
     /// Checks that gate `publish`. If none is marked, every check gates.

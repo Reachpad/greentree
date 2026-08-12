@@ -59,7 +59,13 @@ cd your-repo
 greentree init      # detects pnpm/npm/cargo/go/uv, writes greentree.yaml
 greentree test      # snapshot + run checks (instant when the tree is known)
 greentree gate      # verify (cache-aware) then commit the verified tree
+greentree watch     # run watch-marked checks whenever the tree settles
 ```
+
+`watch` kills an in-flight check the moment you edit again (its verdict
+could never bind to a tree anyway) and adaptively widens its settle window
+so constant editing can't starve verification. `greentree gc` prunes old
+snapshot anchors and trims logs.
 
 Every verb takes `--json` for machine-readable output and returns stable
 exit codes — the contract is in [docs/SPEC.md](docs/SPEC.md). Agents should
@@ -73,6 +79,7 @@ version: 1
 checks:
   quick:
     run: pnpm lint && pnpm test
+    watch: true         # run from `greentree watch` on each settle
   full:
     run: pnpm test && pnpm build
     required_for_publish: true
