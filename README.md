@@ -315,7 +315,7 @@ Stated here because a verification tool that oversells is worse than none:
   your agents), before it is pushed. It is not a sandbox for untrusted
   code, and it does not pull in and run other people's commits. Verifying
   untrusted contributions (fork pull requests) is a job for an isolated,
-  ephemeral runner, not greentree.
+  ephemeral runner, not greentree. See [SECURITY.md](SECURITY.md).
 - Undeclared environment (toolchain versions, system libraries) is not in
   the verdict key. Declare what matters in `inputs:`.
 - An edit-and-revert during a single check run (ABA) is undetectable until
