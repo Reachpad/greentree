@@ -13,7 +13,7 @@ use crate::git::Git;
 use crate::runner::short;
 use crate::{Error, Result};
 
-pub const TOKEN_ENVS: &[&str] = &["GREENTREE_GITHUB_TOKEN", "GITHUB_TOKEN"];
+pub use crate::TOKEN_ENVS;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct RepoSlug {

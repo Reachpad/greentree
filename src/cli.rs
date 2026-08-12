@@ -64,24 +64,9 @@ pub enum Command {
     },
 
     /// Post greentree/<check> statuses for HEAD if its tree is verified.
+    /// The gate before GitHub: verify while working, push with plain git,
+    /// attest, and let a required status check enforce it server-side.
     Attest,
-
-    /// Be the CI: poll a remote, verify each new commit in this warm
-    /// clone, and post its outcome statuses. Owns the clone (hard resets).
-    Serve {
-        /// Remote to poll.
-        #[arg(long, default_value = "origin")]
-        remote: String,
-        /// Branch to serve; defaults to the currently checked-out branch.
-        #[arg(long)]
-        branch: Option<String>,
-        /// Poll interval, e.g. 30s.
-        #[arg(long, default_value = "30s")]
-        interval: String,
-        /// Handle one new commit, then exit (scripting/tests).
-        #[arg(long)]
-        once: bool,
-    },
 
     /// Run watch-marked checks whenever the tree settles; kill runs on edit.
     Watch {

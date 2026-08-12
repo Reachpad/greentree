@@ -15,11 +15,15 @@ pub mod github;
 pub mod lock;
 pub mod publish;
 pub mod runner;
-pub mod serve;
 pub mod snapshot;
 pub mod watch;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Environment variables that may carry a GitHub token. Scrubbed from every
+/// check subprocess so commit-supplied `run:` code can never read greentree's
+/// credentials (see runner.rs); read only when posting statuses (github.rs).
+pub const TOKEN_ENVS: &[&str] = &["GREENTREE_GITHUB_TOKEN", "GITHUB_TOKEN"];
 
 /// Stable exit codes — part of the public contract (see docs/SPEC.md).
 pub mod exit {

@@ -140,6 +140,14 @@ pub fn run_check_with(
     for var in GIT_ENV_OVERRIDES {
         cmd.env_remove(var); // our shadow index must never leak into the check
     }
+    // Never expose greentree's own credentials to a check. `serve` runs
+    // commit-supplied `run:` code with a status token in its environment; a
+    // check must not be able to read it. Scrubbed everywhere (test/gate/
+    // watch too) so the guarantee does not depend on how greentree was
+    // invoked. The token reaches only the ureq POST in github.rs.
+    for var in crate::TOKEN_ENVS {
+        cmd.env_remove(var);
+    }
     cmd.env("GREENTREE_TREE_SHA", &tree)
         .env("GREENTREE_CHECK", name);
 
@@ -226,23 +234,21 @@ pub fn run_check_with(
         }
         std::thread::sleep(POLL);
     };
-    // The direct child is reaped, but a backgrounded grandchild that
-    // inherited stdout/stderr keeps the pipes open — an unconditional join
-    // would hang forever (`npm run dev &` in a check). Give the drains a
-    // short window, then kill the whole group so the pipes reach EOF.
+    // The direct child is reaped, but a backgrounded grandchild may still
+    // hold the pipes (`npm run dev &`) or may have detached its stdio (a
+    // daemon), which would otherwise survive the run and — under serve —
+    // contaminate the next commit's checkout. Give any pipe-holders a short
+    // window to flush, then ALWAYS kill the whole process group: nothing a
+    // check spawns is allowed to outlive it.
     let drain_deadline = Instant::now() + Duration::from_millis(500);
     while !(t_out.is_finished() && t_err.is_finished()) {
         if Instant::now() >= drain_deadline {
-            tracing::warn!(
-                check = name,
-                "output pipes still open after check exit (backgrounded \
-                 process?); killing the process group"
-            );
-            let _ = killpg(pgid, Signal::SIGKILL);
+            tracing::warn!(check = name, "output pipes still open after check exit");
             break;
         }
         std::thread::sleep(POLL);
     }
+    let _ = killpg(pgid, Signal::SIGKILL);
     let _ = t_out.join();
     let _ = t_err.join();
 
