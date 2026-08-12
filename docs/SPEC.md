@@ -13,9 +13,10 @@ The dirty working tree is content-addressed as a git tree object:
 1. A **shadow index** at `<git-dir>/greentree/index` is seeded from the real
    index (honoring `skip-worktree`/`assume-unchanged`) and re-seeded whenever
    the real index changes. The real index is never written.
-2. `git add -A` (with `core.untrackedCache=true` and any
-   `snapshot.exclude` pathspecs) refreshes the shadow index against the
-   working tree; `git write-tree` emits the tree SHA.
+2. `git add -A` (with `core.untrackedCache=true`) refreshes the shadow
+   index against the working tree; `snapshot.exclude` patterns are then
+   removed from the shadow index (`git rm --cached`, glob pathspecs);
+   `git write-tree` emits the tree SHA.
 3. Captured: tracked files + untracked files not ignored by `.gitignore`,
    minus `snapshot.exclude`. Not captured: ignored files (declare relevant
    ones in `inputs:`), symlink targets outside the repo, dirty submodule

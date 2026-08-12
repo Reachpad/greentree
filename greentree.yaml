@@ -1,0 +1,16 @@
+version: 1
+
+checks:
+  quick:
+    run: cargo clippy --all-targets -- -D warnings
+    watch: true
+    timeout: 10m
+  full:
+    run: just check && just demo
+    required_for_publish: true
+    timeout: 20m
+
+snapshot:
+  # cargo writes target/ constantly during checks; without this, watch's
+  # kill-on-edit would cancel the very build it is running.
+  exclude: ["target"]

@@ -97,6 +97,24 @@ fn snapshot_respects_excludes() {
 }
 
 #[test]
+fn snapshot_excludes_work_on_gitignored_paths() {
+    // Excluding a path that is ALSO gitignored (target/ in a Rust repo)
+    // must not fail the snapshot: `git add` exits 1 when a pathspec names
+    // an ignored path.
+    let (tmp, git) = repo();
+    let mut cfg = config("true");
+    cfg.snapshot.exclude = vec!["target".into()];
+    sh(
+        tmp.path(),
+        "echo target > .gitignore && mkdir target && echo junk > target/out",
+    );
+    let t1 = snapshot(&git, &cfg).expect("snapshot with ignored exclude");
+    sh(tmp.path(), "echo more >> target/out");
+    let t2 = snapshot(&git, &cfg).unwrap();
+    assert_eq!(t1, t2, "excluded+ignored churn must not move the tree");
+}
+
+#[test]
 fn snapshot_refuses_mid_merge() {
     let (tmp, git) = repo();
     sh(

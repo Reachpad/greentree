@@ -36,7 +36,7 @@ pub fn snapshot(git: &Git, cfg: &Config) -> Result<String> {
     let shadow_os: &OsStr = shadow.as_os_str();
     let env: &[(&str, &OsStr)] = &[("GIT_INDEX_FILE", shadow_os)];
 
-    let mut add: Vec<OsString> = vec![
+    let add: Vec<OsString> = vec![
         "-c".into(),
         "core.untrackedCache=true".into(),
         "add".into(),
@@ -44,10 +44,26 @@ pub fn snapshot(git: &Git, cfg: &Config) -> Result<String> {
         "--".into(),
         ".".into(),
     ];
-    for pat in &cfg.snapshot.exclude {
-        add.push(format!(":(exclude,glob){pat}").into());
-    }
     git.run_with(&add, env)?;
+
+    // Excludes are applied by removing paths from the shadow index AFTER the
+    // add, not as `:(exclude)` pathspecs on the add itself: `git add` exits 1
+    // when a pathspec names a gitignored path (e.g. excluding `target` in a
+    // Rust repo), regardless of advice settings.
+    if !cfg.snapshot.exclude.is_empty() {
+        let mut rm: Vec<OsString> = vec![
+            "rm".into(),
+            "-r".into(),
+            "--cached".into(),
+            "--quiet".into(),
+            "--ignore-unmatch".into(),
+            "--".into(),
+        ];
+        for pat in &cfg.snapshot.exclude {
+            rm.push(format!(":(glob){pat}").into());
+        }
+        git.run_with(&rm, env)?;
+    }
 
     let tree = git.run_with(["write-tree"], env)?;
     Ok(tree)
