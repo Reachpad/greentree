@@ -8,11 +8,13 @@ pub mod cache;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod gc;
 pub mod git;
 pub mod lock;
 pub mod publish;
 pub mod runner;
 pub mod snapshot;
+pub mod watch;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

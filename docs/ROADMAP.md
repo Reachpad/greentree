@@ -3,15 +3,13 @@
 v0.1 is the primitive: snapshot, verdict cache, publish gate, `gate`. Each
 milestone after it stays small and composes with the last.
 
-## v0.2 — watch
+## v0.2 — watch (shipped)
 
-- `greentree watch`: filesystem watcher + adaptive debounce; runs quick
-  checks as the tree settles.
-- Kill-on-edit: an in-flight check is killed the moment a non-excluded path
-  changes (its verdict could never be cached anyway); adaptive quiet-window
-  prevents starvation under a continuously-editing agent.
+- `greentree watch`: filesystem watcher + adaptive debounce; runs
+  `watch: true` checks as the tree settles; kill-on-edit; single-instance
+  pidfile; `--once` for scripting.
 - `greentree gc`: snapshot-ref retention (keep-last-N + TTL), log budget.
-- Store moves to sqlite if daemon concurrency demands it.
+- (Deferred: sqlite store — the flock still serializes all writers.)
 
 ## v0.3 — GitHub statuses
 

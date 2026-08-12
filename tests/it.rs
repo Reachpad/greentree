@@ -50,6 +50,7 @@ fn config(run: &str) -> Config {
             required_for_publish: true,
             fresh: None,
             timeout: None,
+            watch: false,
         },
     );
     Config {
@@ -317,6 +318,125 @@ fn changed_declared_input_invalidates_cache() {
     assert!(
         !r3.cached,
         "ignored-but-declared input changed; the tree is the same but the env fingerprint is not"
+    );
+}
+
+#[test]
+fn cancel_flag_kills_run_and_nothing_is_cached() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (_tmp, git) = repo();
+    let cfg = config("sleep 30");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let setter = {
+        let cancel = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            cancel.store(true, Ordering::Relaxed);
+        })
+    };
+    let started = std::time::Instant::now();
+    let r =
+        greentree::runner::run_check_with(&git, &cfg, name, check, &mut store, true, Some(&cancel))
+            .unwrap();
+    setter.join().unwrap();
+
+    assert_eq!(r.verdict.outcome, Outcome::Cancelled);
+    assert!(store.get(&r.verdict.key()).is_none());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "cancel must kill promptly, not wait out the sleep"
+    );
+}
+
+#[test]
+fn gc_prunes_anchors_and_trims_logs() {
+    let (tmp, git) = repo();
+    let cfg = config("echo some-log-output");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+
+    run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    sh(tmp.path(), "echo two > second.txt");
+    run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+
+    let refs = sh(
+        tmp.path(),
+        "git for-each-ref refs/greentree/snapshots/ | wc -l",
+    );
+    assert_eq!(refs, "2", "each tested tree gets one anchor");
+
+    let report = greentree::gc::gc(
+        &git,
+        &greentree::gc::GcOptions {
+            keep: 1,
+            ttl: std::time::Duration::from_secs(3600),
+            log_budget: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.snapshots_pruned, 1);
+    assert_eq!(report.snapshots_kept, 1);
+    assert!(report.logs_deleted >= 2, "zero budget deletes all logs");
+
+    let refs = sh(
+        tmp.path(),
+        "git for-each-ref refs/greentree/snapshots/ | wc -l",
+    );
+    assert_eq!(refs, "1");
+}
+
+#[test]
+fn watch_once_verifies_a_settling_tree() {
+    let (tmp, git) = repo();
+    sh(
+        tmp.path(),
+        "printf 'version: 1\\nchecks:\\n  test:\\n    run: \"test -f base.txt\"\\n    watch: true\\n' > greentree.yaml",
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_greentree"))
+        .args(["watch", "--once", "--json"])
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn watch");
+
+    // Let the watcher install, then make an edit for it to see.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    sh(tmp.path(), "echo edit > watched.txt");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("watch --once did not complete a cycle within 15s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(status.success());
+
+    let mut stdout = String::new();
+    use std::io::Read as _;
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.lines().last().expect("one cycle line")).unwrap();
+    assert_eq!(v["results"][0]["outcome"], "pass", "cycle output: {stdout}");
+    assert!(
+        !git.state_dir().join("watch.pid").exists(),
+        "pidfile removed on exit"
     );
 }
 

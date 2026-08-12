@@ -60,6 +60,42 @@ fn dispatch(cli: &Cli, dir: &Path) -> crate::Result<u8> {
             Ok(exit::OK)
         }
         Command::Gate { push, message } => gate(cli, &git, *push, message.clone()),
+        Command::Watch { once } => {
+            crate::watch::watch(
+                &git,
+                &crate::watch::WatchOptions {
+                    once: *once,
+                    json: cli.json,
+                },
+            )?;
+            Ok(exit::OK)
+        }
+        Command::Gc {
+            keep,
+            ttl,
+            log_budget_mb,
+        } => {
+            let _lock = lock::acquire(&git.state_dir())?;
+            let opts = crate::gc::GcOptions {
+                keep: *keep,
+                ttl: humantime::parse_duration(ttl)
+                    .map_err(|e| Error::Config(format!("invalid ttl {ttl:?}: {e}")))?,
+                log_budget: log_budget_mb * 1024 * 1024,
+            };
+            let report = crate::gc::gc(&git, &opts)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!(
+                    "pruned {} snapshot anchors (kept {}), deleted {} logs ({} bytes)",
+                    report.snapshots_pruned,
+                    report.snapshots_kept,
+                    report.logs_deleted,
+                    report.log_bytes_freed
+                );
+            }
+            Ok(exit::OK)
+        }
     }
 }
 

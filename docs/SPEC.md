@@ -83,6 +83,34 @@ Every step is journaled in `<git-dir>/greentree/publish-journal.json`
 and never mints a second change-id for the same publish. Detached HEAD is
 refused. Publishing bypasses commit hooks by construction.
 
+### Watch (v0.2)
+
+`greentree watch` runs every `watch: true` check when the tree settles.
+Semantics:
+
+- **Kill-on-edit**: a mutation event (create/modify/remove/close-write —
+  never read/access events) on a relevant path kills the in-flight check's
+  process group; the cycle records `cancelled` and is never cached.
+- **Adaptive quiet-window**: 300 ms, doubling after each cancelled cycle,
+  capped at 5 s; reset on a completed cycle. Prevents starvation under a
+  continuously editing agent.
+- Relevance filter: paths under the git dir or matching `snapshot.exclude`
+  never trigger or cancel; everything else does, and snapshot dedupe
+  absorbs ignored-file noise (same tree = cache hit = no visible cycle).
+- The global flock is held only during a cycle; `test`/`gate` interleave
+  between cycles. A second watcher is refused via
+  `<git-dir>/greentree/watch.pid` (stale pidfiles are detected and
+  replaced). `--once` processes one completed cycle then exits.
+
+### Gc (v0.2)
+
+`greentree gc [--keep N] [--ttl DUR] [--log-budget-mb M]` deletes snapshot
+anchors beyond the newest N or older than the TTL (defaults 50 / 14d), and
+trims logs oldest-first to the byte budget (default 256 MB). Deleting an
+anchor unpins objects; disk returns at the repository's next `git gc`.
+Verdicts are never pruned — they are tree-keyed and stay valid without
+their anchor.
+
 ## Exit codes (stable contract)
 
 | code | meaning |
@@ -112,6 +140,9 @@ Errors in JSON mode print `{"error": "...", "exit_code": N}`. Shapes:
 - `gate`: `{gate: "published", checks, publish}` or
   `{gate: "refused", check, outcome, log, log_tail}`
 - `init`: `{config_written, config_path, checks, tree}`
+- `watch --json`: one line per visible cycle:
+  `{tree, results: [{check, outcome, cached, duration_ms}]}`
+- `gc`: `{snapshots_pruned, snapshots_kept, logs_deleted, log_bytes_freed}`
 
 ## Namespaces owned by greentree
 

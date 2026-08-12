@@ -62,4 +62,24 @@ pub enum Command {
         #[arg(long, short)]
         message: Option<String>,
     },
+
+    /// Run watch-marked checks whenever the tree settles; kill runs on edit.
+    Watch {
+        /// Process one settled cycle, then exit (for scripting/tests).
+        #[arg(long)]
+        once: bool,
+    },
+
+    /// Prune snapshot anchors and trim check logs.
+    Gc {
+        /// Snapshot anchors to keep (newest first).
+        #[arg(long, default_value_t = 50)]
+        keep: usize,
+        /// Prune anchors older than this even inside the keep window.
+        #[arg(long, default_value = "14d")]
+        ttl: String,
+        /// Byte budget for check logs, in MB.
+        #[arg(long, default_value_t = 256)]
+        log_budget_mb: u64,
+    },
 }

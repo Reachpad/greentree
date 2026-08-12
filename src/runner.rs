@@ -47,6 +47,21 @@ pub fn run_check(
     store: &mut dyn VerdictStore,
     use_cache: bool,
 ) -> Result<RunResult> {
+    run_check_with(git, cfg, name, check, store, use_cache, None)
+}
+
+/// Like [`run_check`], with an external cancel flag: when set (the watcher
+/// saw an edit), the check's process group is killed immediately — its
+/// verdict could never be cached anyway.
+pub fn run_check_with(
+    git: &Git,
+    cfg: &Config,
+    name: &str,
+    check: &Check,
+    store: &mut dyn VerdictStore,
+    use_cache: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<RunResult> {
     let tree = snapshot(git, cfg)?;
     let (env_fp, env_inputs) = env_fingerprint(&git.root, &cfg.inputs)?;
     let key = VerdictKey {
@@ -137,16 +152,30 @@ pub fn run_check(
     let t_out = drain(stdout, Arc::clone(&sink));
     let t_err = drain(stderr, Arc::clone(&sink));
 
-    // Wait with timeout; escalate SIGTERM -> SIGKILL against the process group.
+    // Wait with timeout/cancel; escalate SIGTERM -> SIGKILL on the process group.
     let pgid = Pid::from_raw(child.id() as i32);
-    let mut timed_out = false;
+    let mut killed: Option<Outcome> = None;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if started_mono.elapsed() >= timeout && !timed_out {
-            timed_out = true;
-            tracing::warn!(check = name, "timeout; sending SIGTERM to process group");
+        let kill_as = if started_mono.elapsed() >= timeout {
+            Some(Outcome::Timeout)
+        } else if cancel
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            Some(Outcome::Cancelled)
+        } else {
+            None
+        };
+        if let Some(kill_outcome) = kill_as {
+            killed = Some(kill_outcome);
+            tracing::warn!(
+                check = name,
+                reason = kill_outcome.as_str(),
+                "killing process group"
+            );
             let _ = killpg(pgid, Signal::SIGTERM);
             let grace_deadline = Instant::now() + GRACE;
             let status = loop {
@@ -175,8 +204,8 @@ pub fn run_check(
         s.finalize()?
     };
 
-    let mut outcome = if timed_out {
-        Outcome::Timeout
+    let mut outcome = if let Some(kill_outcome) = killed {
+        kill_outcome
     } else if let Some(code) = status.code() {
         if code == 0 {
             Outcome::Pass
