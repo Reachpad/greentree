@@ -193,15 +193,9 @@ pub fn env_fingerprint(
         let mut matched = false;
         for entry in walked.flatten() {
             matched = true;
-            if entry.is_file() {
-                let rel = entry
-                    .strip_prefix(root)
-                    .unwrap_or(&entry)
-                    .to_string_lossy()
-                    .into_owned();
-                let bytes = std::fs::read(&entry)?;
-                items.insert(rel, blake3::hash(&bytes).to_hex().to_string());
-            }
+            // A directory match must contribute its files — a declared
+            // input that silently hashes to nothing would never invalidate.
+            hash_input(root, &entry, &mut items)?;
         }
         if !matched {
             items.insert(pattern.clone(), "absent".to_string());
@@ -215,4 +209,22 @@ pub fn env_fingerprint(
         combined.update(b"\n");
     }
     Ok((combined.finalize().to_hex().to_string(), items))
+}
+
+/// Hash one matched input: files directly, directories recursively.
+fn hash_input(root: &Path, entry: &Path, items: &mut BTreeMap<String, String>) -> Result<()> {
+    if entry.is_file() {
+        let rel = entry
+            .strip_prefix(root)
+            .unwrap_or(entry)
+            .to_string_lossy()
+            .into_owned();
+        let bytes = std::fs::read(entry)?;
+        items.insert(rel, blake3::hash(&bytes).to_hex().to_string());
+    } else if entry.is_dir() {
+        for child in std::fs::read_dir(entry)?.flatten() {
+            hash_input(root, &child.path(), items)?;
+        }
+    }
+    Ok(())
 }

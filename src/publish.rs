@@ -67,39 +67,10 @@ pub fn publish(
     let branch = current_branch(git)?;
     let head = git.rev_parse_opt("HEAD")?;
 
-    // Resume path: a prior publish created the commit and moved the ref but
-    // was interrupted before finishing (index sync or push).
-    if let Some(journal) = load_journal(git)? {
-        if journal.tree == tree && journal.new_commit.is_some() && journal.new_commit == head {
-            let commit = journal.new_commit.clone().unwrap();
-            sync_index(git)?;
-            let mut pushed = false;
-            if opts.push {
-                push_with_lease(
-                    git,
-                    &journal.branch,
-                    &commit,
-                    journal.lease.clone().flatten(),
-                )?;
-                pushed = true;
-            }
-            clear_journal(git)?;
-            tracing::info!(commit = %short(&commit), "resumed interrupted publish");
-            return Ok(PublishReport {
-                tree,
-                branch: journal.branch,
-                noop: false,
-                commit: Some(commit),
-                change_id: Some(journal.change_id),
-                pushed,
-                resumed: true,
-                verified_by: Vec::new(),
-            });
-        }
-    }
-
-    // The gate: every required check must have a passing, fresh verdict for
-    // EXACTLY this tree under the CURRENT environment fingerprint.
+    // The gate runs FIRST, unconditionally — including on the resume path.
+    // A leftover journal must never bypass verification: the environment
+    // fingerprint may have changed since the interrupted publish, and a
+    // journal is plain JSON anyone could write.
     let (env_fp, _) = env_fingerprint(&git.root, &cfg.inputs)?;
     let now = SystemTime::now();
     let mut verified_by = Vec::new();
@@ -129,6 +100,45 @@ pub fn publish(
             });
         }
         verified_by.push(name.clone());
+    }
+
+    // Resume path: a prior publish created the commit and moved the ref but
+    // was interrupted before finishing (index sync or push). The gate above
+    // has already re-verified the tree under the current environment.
+    if let Some(journal) = load_journal(git)? {
+        if journal.tree == tree && journal.new_commit.is_some() && journal.new_commit == head {
+            if journal.branch != branch {
+                return Err(Error::Publish(format!(
+                    "interrupted publish was on branch {:?} but HEAD is now on {branch:?}; \
+                     check out {:?} to finish it (or remove .git/greentree/publish-journal.json)",
+                    journal.branch, journal.branch
+                )));
+            }
+            let commit = journal.new_commit.clone().unwrap();
+            sync_index(git)?;
+            let mut pushed = false;
+            if opts.push {
+                push_with_lease(
+                    git,
+                    &journal.branch,
+                    &commit,
+                    journal.lease.clone().flatten(),
+                )?;
+                pushed = true;
+            }
+            clear_journal(git)?;
+            tracing::info!(commit = %short(&commit), "resumed interrupted publish");
+            return Ok(PublishReport {
+                tree,
+                branch: journal.branch,
+                noop: false,
+                commit: Some(commit),
+                change_id: Some(journal.change_id),
+                pushed,
+                resumed: true,
+                verified_by,
+            });
+        }
     }
 
     // Empty diff: this exact tree is already committed at HEAD.
@@ -279,8 +289,12 @@ fn sync_index(git: &Git) -> Result<()> {
     unreachable!()
 }
 
+/// Remote-tracking SHA for the branch on the remote we will actually push
+/// to (NOT hardcoded `origin` — a wrong remote name here turns the lease
+/// into "must not exist" and permanently rejects the push).
 fn remote_tracking(git: &Git, branch: &str) -> Result<Option<String>> {
-    git.rev_parse_opt(&format!("refs/remotes/origin/{branch}"))
+    let remote = default_remote(git)?;
+    git.rev_parse_opt(&format!("refs/remotes/{remote}/{branch}"))
         .map_err(Error::Git)
 }
 
@@ -321,7 +335,16 @@ fn new_change_id() -> Result<String> {
 pub fn load_journal(git: &Git) -> Result<Option<Journal>> {
     let path = git.state_dir().join(JOURNAL_FILE);
     match std::fs::read(&path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(journal) => Ok(Some(journal)),
+            // An unparseable journal is in-flight state we cannot interpret;
+            // silently treating it as "no pending publish" would mint a
+            // second change-id for the same logical publish.
+            Err(e) => Err(Error::Publish(format!(
+                "cannot parse {}: {e}; inspect and remove it to continue",
+                path.display()
+            ))),
+        },
         Err(_) => Ok(None),
     }
 }

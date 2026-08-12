@@ -14,8 +14,11 @@ fmt:
 test:
     cargo nextest run
 
+nofeat:
+    cargo check --no-default-features
+
 # The aggregate gate: run before every push.
-check: build clippy fmt test
+check: build clippy fmt test nofeat
 
 demo:
     bash docs/demo.sh

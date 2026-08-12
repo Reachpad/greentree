@@ -83,18 +83,25 @@ pub fn watch(git: &Git, opts: &WatchOptions) -> Result<()> {
     let mut quiet = QUIET_MIN;
     let mut consecutive_cancels: u32 = 0;
     let mut last_tree: Option<String> = None;
+    // A cancelled cycle consumed the event that cancelled it — there may be
+    // no further event coming, so the next iteration must NOT block waiting
+    // for one or the final tree is never verified.
+    let mut pending_work = false;
 
     loop {
-        // Block until something relevant changes.
         let cfg = Config::effective(&git.root)?;
         let excludes = compile_excludes(&cfg);
-        loop {
-            match rx.recv() {
-                Ok(ev) if relevant(git, &excludes, &ev) => break,
-                Ok(_) => continue,
-                Err(_) => return Ok(()), // watcher gone
+        if !pending_work {
+            // Block until something relevant changes.
+            loop {
+                match rx.recv() {
+                    Ok(ev) if relevant(git, &excludes, &ev) => break,
+                    Ok(_) => continue,
+                    Err(_) => return Ok(()), // watcher gone
+                }
             }
         }
+        pending_work = false;
         // Debounce: wait for a quiet gap, restarting on each relevant event.
         loop {
             match rx.recv_timeout(quiet) {
@@ -138,6 +145,7 @@ pub fn watch(git: &Git, opts: &WatchOptions) -> Result<()> {
                 let run = || -> Result<Vec<(String, RunResult)>> {
                     let mut store = JsonStore::open(&git.state_dir())?;
                     let mut results = Vec::new();
+                    let mut pre_tree: Option<String> = None;
                     for (name, check) in &watch_checks {
                         let r = run_check_with(
                             &git,
@@ -147,7 +155,9 @@ pub fn watch(git: &Git, opts: &WatchOptions) -> Result<()> {
                             &mut store,
                             true,
                             Some(&cancel),
+                            pre_tree.take(),
                         )?;
+                        pre_tree = Some(r.tree_after.clone());
                         let outcome = r.verdict.outcome;
                         results.push((name.clone(), r));
                         if outcome == Outcome::Cancelled {
@@ -180,6 +190,7 @@ pub fn watch(git: &Git, opts: &WatchOptions) -> Result<()> {
         if cancelled {
             consecutive_cancels += 1;
             quiet = (QUIET_MIN * 2u32.saturating_pow(consecutive_cancels)).min(QUIET_MAX);
+            pending_work = true; // re-settle and re-run even if no more events come
             tracing::debug!(?quiet, consecutive_cancels, "cycle cancelled by edit");
             continue;
         }
@@ -262,6 +273,60 @@ fn relevant(git: &Git, excludes: &[glob::Pattern], event: &notify::Event) -> boo
             return false;
         }
         let rel = p.strip_prefix(&git.root).unwrap_or(p);
-        !excludes.iter().any(|pat| pat.matches_path(rel))
+        !excluded(rel, excludes)
     })
+}
+
+/// Match a repo-relative path against snapshot excludes with semantics
+/// aligned to git's pathspec side: a pattern matching any ancestor excludes
+/// the whole subtree (git's `:(exclude,glob)target` covers files under
+/// `target/`, so `target/out.log` must not cancel a cycle either), and `*`
+/// does not cross `/`.
+pub(crate) fn excluded(rel: &std::path::Path, excludes: &[glob::Pattern]) -> bool {
+    let opts = glob::MatchOptions {
+        require_literal_separator: true,
+        ..Default::default()
+    };
+    excludes.iter().any(|pat| {
+        rel.ancestors()
+            .filter(|a| !a.as_os_str().is_empty())
+            .any(|a| pat.matches_path_with(a, opts))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::excluded;
+    use std::path::Path;
+
+    fn pats(list: &[&str]) -> Vec<glob::Pattern> {
+        list.iter()
+            .map(|p| glob::Pattern::new(p).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn exclude_matches_files_under_excluded_dir() {
+        let excludes = pats(&["target"]);
+        assert!(excluded(Path::new("target/out.log"), &excludes));
+        assert!(excluded(Path::new("target"), &excludes));
+        assert!(!excluded(Path::new("src/main.rs"), &excludes));
+        assert!(!excluded(Path::new("subdir/target/x"), &excludes));
+    }
+
+    #[test]
+    fn exclude_globs_align_with_git_side() {
+        let excludes = pats(&["docs/generated/**", "*.log"]);
+        assert!(excluded(Path::new("docs/generated/api.md"), &excludes));
+        assert!(excluded(
+            Path::new("docs/generated/deep/nested.md"),
+            &excludes
+        ));
+        assert!(excluded(Path::new("build.log"), &excludes));
+        assert!(
+            !excluded(Path::new("nested/build.log"), &excludes),
+            "* must not cross / (git glob semantics)"
+        );
+        assert!(!excluded(Path::new("docs/index.md"), &excludes));
+    }
 }

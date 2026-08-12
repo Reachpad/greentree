@@ -45,7 +45,9 @@ matching the config's `inputs:` globs (a missing input is recorded as
 Checks run as `/bin/sh -c <run>` from the repo root, in their own process
 group, with all `GIT_*` redirection variables scrubbed and
 `GREENTREE_TREE_SHA` / `GREENTREE_CHECK` added. Timeout: SIGTERM to the
-group, 5 s grace, SIGKILL. Output is streamed to
+group, 5 s grace, SIGKILL. The process group is also killed when the check
+exits while something it backgrounded still holds its output pipes — a
+check is not a way to leave daemons running. Output is streamed to
 `<git-dir>/greentree/logs/`, capped (head + tail retained), with a blake3
 digest computed over the *full* stream.
 
@@ -65,7 +67,12 @@ attestation.
 
 1. Snapshot; require a `pass` verdict — fresh within the check's `fresh:`
    window, under the *current* env fingerprint — for every
-   `required_for_publish` check (or every check if none is marked).
+   `required_for_publish` check (or every check if none is marked). This
+   gate runs unconditionally, **including when resuming an interrupted
+   publish from the journal** — a journal never bypasses verification. A
+   resume is also refused if HEAD has moved to a different branch, and an
+   unparseable journal is a loud error, never treated as "no pending
+   publish".
 2. If the tree already equals `HEAD^{tree}`: no-op (push-only if `--push`).
 3. `git commit-tree <tree> -p <parent>` with the message plus a
    `Greentree-Change-Id: <32-hex>` trailer. The parent is recorded
@@ -117,6 +124,8 @@ After a pushed publish, greentree posts one commit status per verified
 check — context `greentree/<check>`, state `success`, description
 `verified tree <short-sha>` — on the pushed commit. Mechanics:
 
+- Compiled in via the default `github` cargo feature;
+  `--no-default-features` builds the pure-git tool with no HTTP/TLS stack.
 - Token: `GREENTREE_GITHUB_TOKEN` or `GITHUB_TOKEN` (classic PAT needs
   `repo:status`; fine-grained needs "Commit statuses" read/write). No
   token, or a non-github.com remote → posting is silently skipped.
@@ -147,15 +156,21 @@ check — context `greentree/<check>`, state `success`, description
 Every verb accepts `--json` and prints exactly one JSON object to stdout.
 Errors in JSON mode print `{"error": "...", "exit_code": N}`. Shapes:
 
-- `test`: `{tree, ok, results: [{check, outcome, cached, exit_code,
-  duration_ms, log, log_tail?}]}`
+- `test`: `{tree, ok, results: [{check, tree, outcome, cached, exit_code,
+  duration_ms, log, log_tail?}]}`. `ok` is true only when every check
+  passed **and** all verdicts bind to the same tree (an edit between
+  checks makes `ok` false even if each check passed on its own tree).
 - `status`: `{tree, branch, head, tree_at_head, publishable,
   checks: [{check, state, finished}], pending_publish}`
-  where `state` ∈ `pass | fail | stale | missing | error | timeout | cancelled`
+  where `state` ∈ `pass | fail | stale | missing | error | timeout | cancelled`.
+  `status` waits up to 3 s for the lock instead of failing with exit 13
+  while a check is running.
 - `publish`: `{tree, branch, noop, commit, change_id, pushed, resumed,
   verified_by, statuses_posted, statuses_error}`
-- `gate`: `{gate: "published", checks, publish}` or
-  `{gate: "refused", check, outcome, log, log_tail}`
+- `gate`: `{gate: "published", checks: [{check, tree, outcome, cached,
+  duration_ms}], publish}` — `publish` is the same object the `publish`
+  verb prints (statuses fields included) — or
+  `{gate: "refused", check, tree, outcome, log, log_tail}`
 - `init`: `{config_written, config_path, checks, tree}`
 - `watch --json`: one line per visible cycle:
   `{tree, results: [{check, outcome, cached, duration_ms}]}`

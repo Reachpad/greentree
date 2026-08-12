@@ -133,21 +133,16 @@ impl Git {
         }
     }
 
-    /// Absolute path of a file inside the git dir (worktree-aware).
-    pub fn git_path(&self, name: &str) -> Result<PathBuf, GitError> {
-        let p = self.run(["rev-parse", "--git-path", name])?;
-        let p = PathBuf::from(p);
-        Ok(if p.is_absolute() {
-            p
-        } else {
-            self.root.join(p)
-        })
-    }
-
+    /// git's version string, spawned once per process.
     pub fn version(&self) -> String {
-        self.run(["--version"])
-            .map(|s| s.trim_start_matches("git version ").to_string())
-            .unwrap_or_else(|_| "unknown".into())
+        static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        VERSION
+            .get_or_init(|| {
+                self.run(["--version"])
+                    .map(|s| s.trim_start_matches("git version ").to_string())
+                    .unwrap_or_else(|_| "unknown".into())
+            })
+            .clone()
     }
 }
 

@@ -53,16 +53,39 @@ pub fn gc(git: &Git, opts: &GcOptions) -> Result<GcReport> {
         "--format=%(refname)\t%(committerdate:unix)",
         "refs/greentree/snapshots/",
     ])?;
-    let mut pruned = 0;
+    let mut doomed: Vec<&str> = Vec::new();
     let mut kept = 0;
     for (index, line) in refs.lines().filter(|l| !l.is_empty()).enumerate() {
         let (refname, date) = line.split_once('\t').unwrap_or((line, "0"));
         let age = now.saturating_sub(date.parse::<u64>().unwrap_or(0));
         if index >= opts.keep || age > opts.ttl.as_secs() {
-            git.run(["update-ref", "-d", refname])?;
-            pruned += 1;
+            doomed.push(refname);
         } else {
             kept += 1;
+        }
+    }
+    let pruned = doomed.len();
+    if !doomed.is_empty() {
+        // One `update-ref --stdin` transaction instead of a spawn per ref.
+        use std::io::Write as _;
+        let mut child = git
+            .command(["update-ref", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            for refname in &doomed {
+                writeln!(stdin, "delete {refname}")?;
+            }
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            return Err(crate::Error::Publish(format!(
+                "gc ref deletion failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
         }
     }
 
@@ -84,8 +107,12 @@ pub fn gc(git: &Git, opts: &GcOptions) -> Result<GcReport> {
     let mut used: u64 = 0;
     let mut logs_deleted = 0;
     let mut log_bytes_freed = 0;
+    let mut over_budget = false;
     for (path, _, size) in logs {
-        if used + size > opts.log_budget {
+        // Contiguous cutoff: once the budget is reached, everything OLDER
+        // goes — never skip a large new log while keeping small old ones.
+        over_budget = over_budget || used + size > opts.log_budget;
+        if over_budget {
             std::fs::remove_file(&path)?;
             logs_deleted += 1;
             log_bytes_freed += size;

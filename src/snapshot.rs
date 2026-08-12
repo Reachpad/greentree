@@ -81,20 +81,23 @@ pub fn anchor(git: &Git, tree: &str) -> Result<String> {
 }
 
 /// States in which a tree hash would lie or write-tree would fail.
+/// These are all per-worktree files living directly in the (worktree-
+/// specific) git dir, so a path join replaces six `rev-parse --git-path`
+/// subprocess spawns per snapshot.
 fn refuse_unsnapshotable(git: &Git) -> Result<()> {
     for (file, what) in [
         ("MERGE_HEAD", "a merge is in progress"),
         ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
         ("REVERT_HEAD", "a revert is in progress"),
     ] {
-        if git.git_path(file)?.exists() {
+        if git.git_dir.join(file).exists() {
             return Err(Error::Unsnapshotable(format!(
                 "{what}; finish or abort it first"
             )));
         }
     }
     for dir in ["rebase-merge", "rebase-apply"] {
-        if git.git_path(dir)?.exists() {
+        if git.git_dir.join(dir).exists() {
             return Err(Error::Unsnapshotable(
                 "a rebase is in progress; finish or abort it first".into(),
             ));
@@ -143,7 +146,7 @@ fn refuse_unsnapshotable(git: &Git) -> Result<()> {
 /// changed (the agent staged/committed; skip-worktree and assume-unchanged
 /// bits live there and must be honored).
 fn reseed_if_drifted(git: &Git, shadow: &PathBuf) -> Result<()> {
-    let real = git.git_path("index")?;
+    let real = git.git_dir.join("index");
     let current = match std::fs::metadata(&real) {
         Ok(md) => SeedMeta {
             real_index_mtime_ns: md
