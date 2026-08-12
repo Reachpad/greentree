@@ -64,14 +64,18 @@ struct StatusBody<'a> {
     description: String,
 }
 
-/// Post one `greentree/<check>` success status per verified check on the
-/// published commit. Returns the contexts posted.
-pub fn post_statuses(
-    git: &Git,
-    commit: &str,
-    tree: &str,
-    checks: &[String],
-) -> Result<Vec<String>> {
+/// One check's outcome to report on a commit.
+pub struct StatusEntry {
+    pub check: String,
+    pub success: bool,
+    pub description: String,
+}
+
+/// Post one `greentree/<check>` status per entry on the commit. `publish`
+/// and `attest` only ever post successes (unverified trees are refused
+/// before this point); `serve` reports real outcomes, because a failing
+/// pushed commit deserves a red X, not silence. Returns contexts posted.
+pub fn post_entries(git: &Git, commit: &str, entries: &[StatusEntry]) -> Result<Vec<String>> {
     let token = token_from_env().ok_or_else(|| {
         Error::Publish("no GREENTREE_GITHUB_TOKEN or GITHUB_TOKEN in the environment".into())
     })?;
@@ -85,11 +89,11 @@ pub fn post_statuses(
         slug.owner, slug.repo, commit
     );
     let mut posted = Vec::new();
-    for check in checks {
+    for entry in entries {
         let body = StatusBody {
-            state: "success",
-            context: format!("greentree/{check}"),
-            description: format!("verified tree {}", short(tree)),
+            state: if entry.success { "success" } else { "failure" },
+            context: format!("greentree/{}", entry.check),
+            description: entry.description.clone(),
         };
         let response = ureq::post(&api)
             .set("Authorization", &format!("Bearer {token}"))
@@ -108,6 +112,24 @@ pub fn post_statuses(
         }
     }
     Ok(posted)
+}
+
+/// Success statuses for verified checks (the publish/attest path).
+pub fn post_statuses(
+    git: &Git,
+    commit: &str,
+    tree: &str,
+    checks: &[String],
+) -> Result<Vec<String>> {
+    let entries: Vec<StatusEntry> = checks
+        .iter()
+        .map(|check| StatusEntry {
+            check: check.clone(),
+            success: true,
+            description: format!("verified tree {}", short(tree)),
+        })
+        .collect();
+    post_entries(git, commit, &entries)
 }
 
 #[cfg(test)]

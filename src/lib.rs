@@ -15,6 +15,7 @@ pub mod github;
 pub mod lock;
 pub mod publish;
 pub mod runner;
+pub mod serve;
 pub mod snapshot;
 pub mod watch;
 

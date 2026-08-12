@@ -135,6 +135,8 @@ its conventional test command.
 | `publish` | Creates a commit from the current tree; exit 11 unless verified |
 | `gate` | `test` for required checks, then `publish` if green; idempotent |
 | `watch` | Reruns watch-marked checks on every settle; kills runs on edit |
+| `attest` | Posts `greentree/<check>` statuses for HEAD if its tree is verified |
+| `serve` | Polls a remote and verifies each new commit in a warm clone; posts outcomes |
 | `gc` | Prunes snapshot anchors and trims logs |
 
 Every command takes `--json` (exactly one JSON object on stdout) and
@@ -219,11 +221,37 @@ greentree gate --json -m "<message>"
 snippet and a Claude Code hook that blocks `git commit`/`git push` so the
 gate is the only door.
 
-### In CI
+### As the CI: a warm runner instead of a cold one
 
-The composite action restores `.git/greentree` from the actions cache and
-runs `greentree test --json`. A commit whose tree was already verified
-costs nothing; changed content genuinely re-runs.
+A cold runner re-derives everything per push: clone, toolchain,
+dependencies, full test run. `greentree serve` replaces it with a
+dedicated clone on any machine that stays on (a [reachpad](https://reachpad.dev)
+workspace, a spare VPS, the box you already develop on):
+
+```sh
+git clone https://github.com/you/your-repo runner && cd runner
+GITHUB_TOKEN=... greentree serve --branch main
+```
+
+serve polls the remote, checks each new commit out into the warm working
+copy (incremental build caches and ignored dirs survive between runs),
+verifies it, and posts one `greentree/<check>` status per outcome,
+failures included. Content already verified anywhere the clone has seen
+it (rebases, reverts, message rewrites) is a tree-hash cache hit and
+re-attests in seconds. Push from a laptop, an agent, anywhere: the warm
+clone is the runner.
+
+Three ways a commit ends up attested, all landing the same status:
+
+| flow | who verifies | runner minutes |
+|---|---|---|
+| `greentree gate --push` | your workspace, before the push | none |
+| plain `git push`, serve running | the warm runner clone | none (your machine) |
+| plain `git push` + `greentree attest` | your workspace, after the push | none |
+
+The composite action remains as the cold-isolation fallback, mainly for
+pull requests from forks, where you want an ephemeral runner for
+untrusted code:
 
 ```yaml
 - uses: actions/checkout@v4
