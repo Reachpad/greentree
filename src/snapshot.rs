@@ -97,33 +97,24 @@ pub fn anchor(git: &Git, tree: &str) -> Result<String> {
 }
 
 /// States in which a tree hash would lie or write-tree would fail.
-/// These are all per-worktree files living directly in the (worktree-
-/// specific) git dir, so a path join replaces six `rev-parse --git-path`
-/// subprocess spawns per snapshot.
+///
+/// Only those. Snapshot asks one question — *is there an honest tree here?* —
+/// and a half-finished merge, cherry-pick, revert or rebase step whose
+/// conflicts have all been resolved answers yes: the working tree is an
+/// ordinary tree that deserves to be tested and cached like any other. What
+/// such a state may forbid is *creating a commit*, which is publish's
+/// question and lives in `publish::refuse_unpublishable`.
 fn refuse_unsnapshotable(git: &Git) -> Result<()> {
-    for (file, what) in [
-        ("MERGE_HEAD", "a merge is in progress"),
-        ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
-        ("REVERT_HEAD", "a revert is in progress"),
-    ] {
-        if git.git_dir.join(file).exists() {
-            return Err(Error::Unsnapshotable(format!(
-                "{what}; finish or abort it first"
-            )));
-        }
-    }
-    for dir in ["rebase-merge", "rebase-apply"] {
-        if git.git_dir.join(dir).exists() {
-            return Err(Error::Unsnapshotable(
-                "a rebase is in progress; finish or abort it first".into(),
-            ));
-        }
-    }
     // Unmerged entries live in the REAL index; they never appear in the shadow.
+    // With conflicts outstanding there is no single tree to name: `write-tree`
+    // would silently hash one side of every conflicted path.
     let unmerged = git.run(["ls-files", "-u"])?;
     if !unmerged.is_empty() {
         return Err(Error::Unsnapshotable(
-            "the index has unmerged (conflicted) entries".into(),
+            "the index has unmerged (conflicted) entries; resolve them and \
+             `git add` the results — a resolved merge or cherry-pick snapshots \
+             and tests like any other tree"
+                .into(),
         ));
     }
     // Dirty submodules are invisible to the superproject tree hash: the

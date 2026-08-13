@@ -13,10 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
-pub const VERDICT_SCHEMA_VERSION: u32 = 1;
+/// 2 added the disk-observation fields. A record whose `schema_version` is
+/// not this one is skipped on load (see `JsonStore::open`) — a bump costs one
+/// cache miss per key, never an error.
+pub const VERDICT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// Check exited 0. Cacheable.
     Pass,
@@ -28,6 +31,9 @@ pub enum Outcome {
     Timeout,
     /// The tree changed while the check ran; the result binds to no tree. Not cacheable.
     Cancelled,
+    /// Free disk fell below `min_free_disk` mid-run and the check was killed.
+    /// Like a timeout, the tree was never judged. Not cacheable.
+    DiskExhausted,
 }
 
 impl Outcome {
@@ -41,6 +47,7 @@ impl Outcome {
             Outcome::Error => "error",
             Outcome::Timeout => "timeout",
             Outcome::Cancelled => "cancelled",
+            Outcome::DiskExhausted => "disk_exhausted",
         }
     }
 }
@@ -82,6 +89,11 @@ pub struct Verdict {
     pub started: String,
     pub finished: String,
     pub duration_ms: u64,
+    /// Free bytes on the filesystem holding the repo when the check started,
+    /// and the least seen while it ran (equal when never sampled lower).
+    /// Filesystem-level observations: other writers confound attribution.
+    pub disk_free_start_bytes: u64,
+    pub disk_free_min_bytes: u64,
     /// Unix seconds of `finished`, used for freshness checks.
     pub finished_unix: u64,
     pub os: String,
@@ -149,8 +161,15 @@ impl JsonStore {
                 }
                 // A line that fails to parse (partial append after a crash,
                 // schema drift) is skipped: the store is a cache, never fatal.
+                // The version is checked EXPLICITLY rather than left to serde:
+                // a future schema that only adds optional fields would still
+                // deserialize into today's `Verdict` and hand back a record
+                // whose meaning we do not know.
                 if let Ok(raw) = serde_json::from_str::<Box<serde_json::value::RawValue>>(line) {
                     if let Ok(v) = serde_json::from_str::<Verdict>(raw.get()) {
+                        if v.schema_version != VERDICT_SCHEMA_VERSION {
+                            continue;
+                        }
                         verdicts.insert(v.key().as_string(), raw);
                     }
                 }
@@ -201,5 +220,84 @@ impl VerdictStore for JsonStore {
 impl From<serde_json::Error> for crate::Error {
     fn from(e: serde_json::Error) -> Self {
         crate::Error::Io(std::io::Error::other(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verdict() -> Verdict {
+        Verdict {
+            schema_version: VERDICT_SCHEMA_VERSION,
+            tree: "t".into(),
+            check: "c".into(),
+            command: "true".into(),
+            shell: "/bin/sh".into(),
+            check_hash: "h".into(),
+            env_fingerprint: "e".into(),
+            env_inputs: BTreeMap::new(),
+            outcome: Outcome::Pass,
+            exit_code: Some(0),
+            signal: None,
+            started: "2026-01-01T00:00:00Z".into(),
+            finished: "2026-01-01T00:00:01Z".into(),
+            duration_ms: 1000,
+            disk_free_start_bytes: 0,
+            disk_free_min_bytes: 0,
+            finished_unix: 0,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            git_version: "2.43.0".into(),
+            greentree_version: crate::VERSION.into(),
+            snapshot_ref: "refs/greentree/snapshots/t".into(),
+            log_path: "/dev/null".into(),
+            log_bytes: 0,
+            log_digest: "d".into(),
+            log_truncated: false,
+        }
+    }
+
+    #[test]
+    fn records_from_another_schema_version_are_skipped() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut value = serde_json::to_value(verdict()).expect("serialize");
+        // A future record: every field this version knows, plus a version we
+        // do not. It parses cleanly — only the explicit check rejects it.
+        value["schema_version"] = serde_json::json!(999);
+        // A schema-1 record: the disk fields did not exist yet.
+        let mut v1 = serde_json::to_value(verdict()).expect("serialize");
+        v1["schema_version"] = serde_json::json!(1);
+        v1["tree"] = serde_json::json!("t1");
+        let obj = v1.as_object_mut().unwrap();
+        obj.remove("disk_free_start_bytes");
+        obj.remove("disk_free_min_bytes");
+
+        std::fs::write(
+            dir.path().join("verdicts.jsonl"),
+            format!("{v1}\n{value}\n\nnot json at all\n"),
+        )
+        .expect("write store");
+
+        let store = JsonStore::open(dir.path()).expect("open");
+        assert!(
+            store.verdicts.is_empty(),
+            "loaded records from a foreign schema: {:?}",
+            store.verdicts.keys().collect::<Vec<_>>()
+        );
+        assert!(store.get(&verdict().key()).is_none());
+    }
+
+    #[test]
+    fn a_current_record_round_trips() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut store = JsonStore::open(dir.path()).expect("open");
+        let v = verdict();
+        store.put(v.clone()).expect("put");
+        let reopened = JsonStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            reopened.get(&v.key()).map(|r| r.outcome),
+            Some(Outcome::Pass)
+        );
     }
 }

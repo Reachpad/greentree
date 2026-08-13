@@ -36,6 +36,7 @@ pub mod exit {
     pub const LOCK_HELD: u8 = 13;
     pub const CONFIG: u8 = 14;
     pub const PUBLISH: u8 = 15;
+    pub const DISK_FLOOR: u8 = 16;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,12 +47,32 @@ pub enum Error {
     Config(String),
     #[error("cannot snapshot: {0}")]
     Unsnapshotable(String),
+    /// The tree is honest and testable, but no commit can be created from it
+    /// right now (a rebase owns the next commit). Shares exit code 12 with
+    /// `Unsnapshotable`: both mean "fix the repository state, then retry".
+    #[error("cannot publish: {0}")]
+    Unpublishable(String),
     #[error("another greentree process holds the lock")]
     LockHeld,
     #[error("tree {tree} is not verified: {reason}")]
     NotVerified { tree: String, reason: String },
     #[error("publish failed: {0}")]
     Publish(String),
+    /// Free disk is below the check's floor, so the check is not started at
+    /// all. A refusal, not an outcome: no verdict is recorded.
+    #[error(
+        "check {check:?} not started: {} free on the filesystem holding {root}, \
+         below its {} min_free_disk floor; lower `min_free_disk` in greentree.yaml \
+         (per check or top level), or set it to \"0\" to disable the floor",
+        crate::config::format_bytes(*free),
+        crate::config::format_bytes(*floor)
+    )]
+    DiskFloor {
+        check: String,
+        floor: u64,
+        free: u64,
+        root: String,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -61,10 +82,11 @@ impl Error {
         match self {
             Error::Git(_) | Error::Io(_) => exit::ERROR,
             Error::Config(_) => exit::CONFIG,
-            Error::Unsnapshotable(_) => exit::UNSNAPSHOTABLE,
+            Error::Unsnapshotable(_) | Error::Unpublishable(_) => exit::UNSNAPSHOTABLE,
             Error::LockHeld => exit::LOCK_HELD,
             Error::NotVerified { .. } => exit::NOT_VERIFIED,
             Error::Publish(_) => exit::PUBLISH,
+            Error::DiskFloor { .. } => exit::DISK_FLOOR,
         }
     }
 }

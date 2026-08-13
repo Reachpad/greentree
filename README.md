@@ -98,9 +98,10 @@ flowchart LR
    again on resume. Every commit carries a `Greentree-Change-Id` trailer,
    the stable identity that will let stacks of verified changes survive
    rebases (see the [roadmap](docs/ROADMAP.md)).
-4. **Statuses.** With a GitHub token in the environment, a pushed publish
-   posts a `greentree/<check>` commit status on the new SHA. Statuses
-   satisfy branch protection required checks.
+4. **Statuses.** With a GitHub token available (an env var, or `gh auth
+   token` if you're signed in with the `gh` CLI), a pushed publish posts a
+   `greentree/<check>` commit status on the new SHA. Statuses satisfy
+   branch protection required checks.
 
 ## Install
 
@@ -147,10 +148,11 @@ Every command takes `--json` (exactly one JSON object on stdout) and
 | 0 | success: checks green, published, or no-op |
 | 10 | a check ran and failed |
 | 11 | publish refused: tree not verified |
-| 12 | unsnapshotable state: mid-merge, conflicted index, dirty submodule |
+| 12 | repository state blocks it: conflicted index, dirty submodule, or publishing mid-rebase |
 | 13 | another greentree process holds the lock |
 | 14 | configuration error |
 | 15 | publish machinery failed: CAS refused, push rejected, no remote |
+| 16 | free disk below `min_free_disk`: check refused, or aborted mid-run |
 
 Full JSON shapes and the verdict record schema are in
 [docs/SPEC.md](docs/SPEC.md).
@@ -159,6 +161,8 @@ Full JSON shapes and the verdict record schema are in
 
 ```yaml
 version: 1
+
+min_free_disk: 10G     # floor for every check; default 5G, "0" disables
 
 checks:
   quick:
@@ -169,6 +173,8 @@ checks:
     required_for_publish: true
     fresh: 30m           # a pass older than this will not satisfy the gate
     timeout: 20m         # default 15m; SIGTERM, 5s grace, SIGKILL
+    min_free_disk: 60G   # this check's own floor: refuse to start below it,
+                         # and kill it if free space falls under it mid-run
 
 snapshot:
   exclude: ["docs/generated/**"]   # paths checks may write without
@@ -200,6 +206,10 @@ freely with a running watcher.
 - Checks run under `/bin/sh -c` in their own process group with `GIT_*`
   redirection variables scrubbed: a `git` command inside your test suite
   sees your real repo, never greentree's shadow index.
+- Checks are bounded in time and in disk: below `min_free_disk` free space
+  a check is refused before it starts (exit 16), and one that eats through
+  the floor mid-run is killed like a timeout, so a build cannot fill the
+  machine it runs on.
 - greentree never writes your index, your worktree, or your refs outside
   `refs/greentree/*`, except at publish, where the ref move is a
   compare-and-swap and the push records its lease explicitly.
@@ -259,11 +269,11 @@ A commit that never went through a workspace has no status and cannot
 merge. To get green, route it through verification. That is the whole
 enforcement, with zero CI minutes.
 
-greentree posts statuses with a GitHub token from the environment
-(`GREENTREE_GITHUB_TOKEN` or `GITHUB_TOKEN`). Checks never see it: the
-token is scrubbed from every check subprocess and reaches only the status
-API call. Use a fine-grained token scoped to the repo with "Commit
-statuses: write".
+greentree posts statuses with a GitHub token resolved from
+`GREENTREE_GITHUB_TOKEN`, then `GITHUB_TOKEN`, then (if neither is set and
+`gh` is on PATH) `gh auth token`. Checks never see it: the token is
+scrubbed from every check subprocess and reaches only the status API call.
+Use a fine-grained token scoped to the repo with "Commit statuses: write".
 
 Verification runs wherever you invoke greentree. Pointing it at a
 persistent warm workspace instead of the local machine, so the cache and

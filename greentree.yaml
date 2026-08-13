@@ -1,5 +1,11 @@
 version: 1
 
+# A cargo build writes hundreds of megabytes; refuse to start rather than fill
+# the disk of the box a check runs on. Kept low enough to admit a run on a
+# nearly-full dev box or a stock CI runner (~14G free) — the floor is a
+# backstop against filling a disk, not a capacity plan.
+min_free_disk: 2G
+
 checks:
   quick:
     run: cargo clippy --all-targets -- -D warnings
