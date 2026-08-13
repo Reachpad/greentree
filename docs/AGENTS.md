@@ -20,8 +20,9 @@ it twice in a row is a no-op. Branch on exit code, not on output text:
 | 0 | published (or already published) | done |
 | 10 | a check failed | read `log_tail` in the JSON, fix, rerun |
 | 11 | tree changed after its last verification | rerun `gate` |
-| 12 | repo mid-merge/rebase or dirty submodule | resolve, rerun |
+| 12 | conflicted index or dirty submodule; or `gate` during a rebase | resolve conflicts (`git add`) / finish the rebase, rerun |
 | 13 | another greentree run in flight | wait, rerun |
+| 16 | free disk below `min_free_disk` | free space, then rerun |
 
 While iterating, `greentree test --json` gives the same verdicts without
 publishing. `greentree status --json` answers "would publish succeed?"

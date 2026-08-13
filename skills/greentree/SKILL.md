@@ -32,10 +32,11 @@ Add `--push` to also push. Without it, `gate` commits locally only.
 | 0 | verified and committed | done |
 | 10 | a check failed | read `.log_tail` in the JSON, fix the code, run `gate` again |
 | 11 | tree not verified yet | run `greentree test --json`, then `gate` |
-| 12 | repo mid-merge/rebase, or a dirty submodule | resolve it, then `gate` |
+| 12 | conflicted index or dirty submodule; or `gate` during a rebase | `git add` the resolved files (a resolved merge/cherry-pick gates fine, and `gate` writes the merge commit); for a rebase, `git rebase --continue` first |
 | 13 | another greentree run is in progress | wait a moment, then retry |
 | 14 | config error | read `.error`; fix `greentree.yaml` |
 | 15 | publish/push failed | read `.error` (e.g. remote rejected, no token) |
+| 16 | free disk below `min_free_disk` | free space (`cargo clean`, prune logs), then retry; lower the floor only deliberately |
 
 ## While iterating
 

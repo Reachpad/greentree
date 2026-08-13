@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 use greentree::cache::{JsonStore, Outcome, VerdictStore};
-use greentree::config::{Check, Config};
+use greentree::config::{Check, Config, DiskSize};
 use greentree::git::Git;
 use greentree::publish::{publish, PublishOptions, CHANGE_ID_TRAILER};
 use greentree::runner::run_check;
@@ -41,6 +41,10 @@ fn repo() -> (TempDir, Git) {
     (tmp, git)
 }
 
+/// The shared config for tests that are not ABOUT the disk floor. The floor
+/// is explicitly disabled: leaving it unset would make every one of these
+/// tests silently require the built-in 5 GiB default of free space, and fail
+/// with a refusal that has nothing to do with what they assert.
 fn config(run: &str) -> Config {
     let mut checks = IndexMap::new();
     checks.insert(
@@ -51,6 +55,7 @@ fn config(run: &str) -> Config {
             fresh: None,
             timeout: None,
             watch: false,
+            min_free_disk: None,
         },
     );
     Config {
@@ -58,6 +63,7 @@ fn config(run: &str) -> Config {
         checks,
         snapshot: Default::default(),
         inputs: Vec::new(),
+        min_free_disk: Some(DiskSize(0)),
     }
 }
 
@@ -114,20 +120,409 @@ fn snapshot_excludes_work_on_gitignored_paths() {
     assert_eq!(t1, t2, "excluded+ignored churn must not move the tree");
 }
 
-#[test]
-fn snapshot_refuses_mid_merge() {
-    let (tmp, git) = repo();
+/// Leave the repo mid-merge with `c.txt` conflicted. Returns (ours, theirs).
+fn conflicted_merge(dir: &Path) -> (String, String) {
     sh(
-        tmp.path(),
+        dir,
         "git checkout -qb other && echo a > c.txt && git add -A && git commit -qm a \
          && git checkout -q main && echo b > c.txt && git add -A && git commit -qm b \
          && git merge other > /dev/null 2>&1 || true",
     );
+    (
+        sh(dir, "git rev-parse HEAD"),
+        sh(dir, "git rev-parse other"),
+    )
+}
+
+#[test]
+fn snapshot_refuses_conflicts_but_not_a_resolved_merge() {
+    // The honest-tree rule: only the conflicted index is unsnapshotable. Once
+    // the conflict is resolved the tree is ordinary and must hash like any
+    // other — being mid-merge is publish's problem, not snapshot's.
+    let (tmp, git) = repo();
+    conflicted_merge(tmp.path());
     let cfg = config("true");
     match snapshot(&git, &cfg) {
         Err(Error::Unsnapshotable(_)) => {}
         other => panic!("expected Unsnapshotable, got {other:?}"),
     }
+
+    sh(tmp.path(), "echo resolved > c.txt && git add c.txt");
+    let tree = snapshot(&git, &cfg).expect("a resolved merge snapshots");
+    assert!(
+        tmp.path().join(".git/MERGE_HEAD").exists(),
+        "still mid-merge — that is the point"
+    );
+    assert_eq!(
+        tree,
+        snapshot(&git, &cfg).unwrap(),
+        "and caches like any tree"
+    );
+}
+
+#[test]
+fn resolved_merge_publishes_a_two_parent_commit() {
+    let (tmp, git) = repo();
+    let (ours, theirs) = conflicted_merge(tmp.path());
+    let cfg = config("grep -q resolved c.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+
+    sh(tmp.path(), "echo resolved > c.txt && git add c.txt");
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    assert_eq!(r.verdict.outcome, Outcome::Pass);
+    let verified_tree = r.verdict.tree.clone();
+    assert!(
+        greentree::publish::merge_in_progress(&git).unwrap(),
+        "a real merge must read as in progress"
+    );
+
+    let report = publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    assert!(!report.noop);
+    let commit = report.commit.unwrap();
+
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%P"),
+        format!("{ours} {theirs}"),
+        "a merge commit, with HEAD and MERGE_HEAD as its parents"
+    );
+    assert_eq!(
+        sh(tmp.path(), "git rev-parse 'HEAD^{tree}'"),
+        verified_tree,
+        "published commit IS the verified tree"
+    );
+    assert_eq!(sh(tmp.path(), "git rev-parse HEAD"), commit);
+    // No -m: the message defaults to MERGE_MSG, minus its comment lines.
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%s"),
+        "Merge branch 'other'"
+    );
+    assert!(sh(tmp.path(), "git log -1 --format=%B").contains(CHANGE_ID_TRAILER));
+
+    for state in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE"] {
+        assert!(
+            !tmp.path().join(".git").join(state).exists(),
+            "{state} survived the merge commit"
+        );
+    }
+    assert_eq!(
+        sh(tmp.path(), "git status --porcelain"),
+        "",
+        "the merge is finished, not merely committed"
+    );
+}
+
+#[test]
+fn octopus_merge_publishes_every_parent() {
+    let (tmp, git) = repo();
+    sh(
+        tmp.path(),
+        "git checkout -qb a && echo a > a.txt && git add -A && git commit -qm a \
+         && git checkout -q main && git checkout -qb b && echo b > b.txt \
+         && git add -A && git commit -qm b && git checkout -q main \
+         && echo m > m.txt && git add -A && git commit -qm m \
+         && git merge --no-commit a b > /dev/null 2>&1 || true",
+    );
+    let heads: Vec<String> = ["HEAD", "a", "b"]
+        .iter()
+        .map(|r| sh(tmp.path(), &format!("git rev-parse {r}")))
+        .collect();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".git/MERGE_HEAD"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "octopus MERGE_HEAD lists one SHA per line"
+    );
+
+    let cfg = config("test -f a.txt && test -f b.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+    assert_eq!(
+        run_check(&git, &cfg, name, check, &mut store, true)
+            .unwrap()
+            .verdict
+            .outcome,
+        Outcome::Pass
+    );
+
+    publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%P"),
+        heads.join(" "),
+        "three parents: HEAD then both MERGE_HEAD lines"
+    );
+    assert!(!tmp.path().join(".git/MERGE_HEAD").exists());
+}
+
+#[test]
+fn resolved_cherry_pick_publishes_a_single_parent_commit() {
+    let (tmp, git) = repo();
+    sh(
+        tmp.path(),
+        "git checkout -qb other && echo a > c.txt && git add -A \
+         && git commit -qm 'the picked commit' && git checkout -q main \
+         && echo b > c.txt && git add -A && git commit -qm b \
+         && git cherry-pick other > /dev/null 2>&1 || true",
+    );
+    assert!(tmp.path().join(".git/CHERRY_PICK_HEAD").exists());
+    let head = sh(tmp.path(), "git rev-parse HEAD");
+
+    let cfg = config("grep -q resolved c.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+    sh(tmp.path(), "echo resolved > c.txt && git add c.txt");
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    assert_eq!(r.verdict.outcome, Outcome::Pass);
+
+    publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%P"),
+        head,
+        "a cherry-pick is an ordinary single-parent commit"
+    );
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%s"),
+        "the picked commit",
+        "the picked commit's message carries over from MERGE_MSG"
+    );
+    assert!(
+        !tmp.path().join(".git/CHERRY_PICK_HEAD").exists(),
+        "CHERRY_PICK_HEAD survived the commit"
+    );
+    assert_eq!(sh(tmp.path(), "git status --porcelain"), "");
+}
+
+#[test]
+fn squash_merge_publishes_one_commit_with_the_squash_message() {
+    // `git merge --squash` leaves SQUASH_MSG + AUTO_MERGE and NO MERGE_HEAD:
+    // one ordinary commit, whose message git takes from SQUASH_MSG.
+    let (tmp, git) = repo();
+    sh(
+        tmp.path(),
+        "git checkout -qb other && echo a > a.txt && git add -A \
+         && git commit -qm 'the squashed commit' && git checkout -q main \
+         && echo m > m.txt && git add -A && git commit -qm m \
+         && git merge --squash other > /dev/null",
+    );
+    let head = sh(tmp.path(), "git rev-parse HEAD");
+    assert!(tmp.path().join(".git/SQUASH_MSG").exists());
+    assert!(
+        !tmp.path().join(".git/MERGE_HEAD").exists(),
+        "a squash merge records no second parent"
+    );
+
+    let cfg = config("test -f a.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    assert_eq!(r.verdict.outcome, Outcome::Pass);
+
+    publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%P"),
+        head,
+        "a squash is a single-parent commit"
+    );
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%s"),
+        "Squashed commit of the following:",
+        "the squash message must not be thrown away"
+    );
+    assert!(sh(tmp.path(), "git log -1 --format=%B").contains("the squashed commit"));
+    for state in ["SQUASH_MSG", "MERGE_MSG", "AUTO_MERGE"] {
+        assert!(
+            !tmp.path().join(".git").join(state).exists(),
+            "{state} survived the squash commit"
+        );
+    }
+    assert_eq!(sh(tmp.path(), "git status --porcelain"), "");
+}
+
+#[test]
+fn a_stale_merge_head_never_mints_a_second_merge_commit() {
+    // A MERGE_HEAD left behind by a crashed cleanup names a commit HEAD
+    // already contains. Publishing must read that as "no merge in progress",
+    // not as a merge to redo — and must retire the stale file.
+    let (tmp, git) = repo();
+    let cfg = config("test -f feature.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let head = sh(tmp.path(), "git rev-parse HEAD");
+    std::fs::write(tmp.path().join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+    std::fs::write(
+        tmp.path().join(".git/MERGE_MSG"),
+        "Merge branch 'already-merged'\n",
+    )
+    .unwrap();
+
+    assert!(
+        !greentree::publish::merge_in_progress(&git).unwrap(),
+        "a MERGE_HEAD HEAD already contains is not a merge in progress"
+    );
+
+    sh(tmp.path(), "echo done > feature.txt");
+    let (name, check) = check_of(&cfg);
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    assert_eq!(r.verdict.outcome, Outcome::Pass);
+
+    let report = publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    assert!(!report.noop);
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%P"),
+        head,
+        "the stale MERGE_HEAD became a second parent"
+    );
+    assert!(
+        sh(tmp.path(), "git log -1 --format=%s").starts_with("greentree: verified tree"),
+        "a stale merge's message must not be inherited either"
+    );
+    assert!(
+        !tmp.path().join(".git/MERGE_HEAD").exists(),
+        "stale MERGE_HEAD survived the publish"
+    );
+    assert_eq!(sh(tmp.path(), "git status --porcelain"), "");
+}
+
+#[test]
+fn comment_char_auto_keeps_a_message_whose_lines_start_with_hash() {
+    // `core.commentChar = auto` picks the first character no line of the
+    // message starts with; stripping `#` regardless would eat this subject.
+    let (tmp, git) = repo();
+    sh(
+        tmp.path(),
+        "git config core.commentChar auto \
+         && git checkout -qb other && echo a > c.txt && git add -A \
+         && git commit -qm '#42: the picked commit' && git checkout -q main \
+         && echo b > c.txt && git add -A && git commit -qm b \
+         && git cherry-pick other > /dev/null 2>&1 || true",
+    );
+    assert!(tmp.path().join(".git/CHERRY_PICK_HEAD").exists());
+
+    let cfg = config("grep -q resolved c.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+    sh(tmp.path(), "echo resolved > c.txt && git add c.txt");
+    run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+
+    publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%s"),
+        "#42: the picked commit",
+        "the subject was stripped as a comment"
+    );
+}
+
+#[test]
+fn rebase_tests_but_refuses_to_publish() {
+    let (tmp, git) = repo();
+    sh(
+        tmp.path(),
+        "git checkout -qb feature && echo f > c.txt && git add -A && git commit -qm f \
+         && git checkout -q main && echo m > c.txt && git add -A && git commit -qm m \
+         && git checkout -q feature && git rebase main > /dev/null 2>&1 || true",
+    );
+    sh(tmp.path(), "echo resolved > c.txt && git add c.txt");
+    assert!(
+        tmp.path().join(".git/rebase-merge").exists()
+            || tmp.path().join(".git/rebase-apply").exists(),
+        "expected a rebase in progress"
+    );
+
+    // Testing is unaffected: the tree is honest, and the verdict is cached
+    // for the tree the rebase will end up producing.
+    let cfg = config("grep -q resolved c.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+    let r = run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+    assert_eq!(r.verdict.outcome, Outcome::Pass);
+
+    // Publishing is not: the next commit belongs to the rebase's sequencer.
+    match publish(&git, &cfg, &store, &PublishOptions::default()) {
+        Err(Error::Unpublishable(msg)) => {
+            assert!(msg.contains("rebase --continue"), "unhelpful: {msg}")
+        }
+        other => panic!("expected Unpublishable, got {other:?}"),
+    }
+
+    // …and `gate` refuses with the same exit code, before running anything.
+    sh(
+        tmp.path(),
+        "printf 'version: 1\\nmin_free_disk: \"0\"\\nchecks:\\n  test:\\n    run: \"true\"\\n' \
+         > greentree.yaml",
+    );
+    let (code, _, stderr) = bin(tmp.path(), &["gate"]);
+    assert_eq!(code, 12, "gate during a rebase: {stderr}");
+    assert!(stderr.contains("rebase"), "unhelpful: {stderr}");
+
+    // …and `status` says so instead of promising a publish that would refuse.
+    let (code, stdout, _) = bin(tmp.path(), &["status", "--json"]);
+    assert_eq!(code, 0, "status keeps working: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["publishable"], serde_json::Value::Bool(false));
+    assert!(
+        v["publish_blocked"]
+            .as_str()
+            .unwrap_or("")
+            .contains("rebase"),
+        "status hid the rebase: {stdout}"
+    );
+    // A rebase detaches HEAD: an empty string reads like a branch we failed
+    // to print, so the contract is null.
+    assert_eq!(
+        v["branch"],
+        serde_json::Value::Null,
+        "detached HEAD must report a null branch: {stdout}"
+    );
+}
+
+#[test]
+fn interrupted_merge_publish_replays_the_full_parent_list() {
+    // Crash between commit-tree and update-ref: the journal is the only
+    // record of the merge's parents, and the retry must rebuild the SAME
+    // commit rather than a single-parent one.
+    let (tmp, git) = repo();
+    let (ours, theirs) = conflicted_merge(tmp.path());
+    let cfg = config("grep -q resolved c.txt");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    let (name, check) = check_of(&cfg);
+    sh(tmp.path(), "echo resolved > c.txt && git add c.txt");
+    let tree = run_check(&git, &cfg, name, check, &mut store, true)
+        .unwrap()
+        .verdict
+        .tree;
+
+    let commit = sh(
+        tmp.path(),
+        &format!("git commit-tree {tree} -p {ours} -p {theirs} -m 'interrupted merge'"),
+    );
+    let journal = serde_json::json!({
+        "schema_version": 2, "tree": tree, "branch": "main",
+        "parents": [ours, theirs],
+        "change_id": "deadbeefdeadbeefdeadbeefdeadbeef", "new_commit": commit, "lease": null,
+    });
+    std::fs::write(
+        git.state_dir().join("publish-journal.json"),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+
+    let report = publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    assert_eq!(
+        report.commit.as_deref(),
+        Some(&*commit),
+        "the journaled commit was reused, not re-minted"
+    );
+    assert_eq!(
+        report.change_id.as_deref(),
+        Some("deadbeefdeadbeefdeadbeefdeadbeef")
+    );
+    assert_eq!(
+        sh(tmp.path(), "git log -1 --format=%P"),
+        format!("{ours} {theirs}")
+    );
+    assert!(!tmp.path().join(".git/MERGE_HEAD").exists());
+    assert!(!git.state_dir().join("publish-journal.json").exists());
 }
 
 #[test]
@@ -285,6 +680,9 @@ fn interrupted_publish_resumes_from_journal() {
         tmp.path(),
         &format!("git update-ref refs/heads/main {commit} {parent}"),
     );
+    // Deliberately the schema-1 shape: a journal left in flight by an older
+    // greentree must still be readable, its single `parent` becoming the
+    // one-element parent list.
     let journal = serde_json::json!({
         "schema_version": 1,
         "tree": tree,
@@ -300,6 +698,14 @@ fn interrupted_publish_resumes_from_journal() {
         serde_json::to_vec(&journal).unwrap(),
     )
     .unwrap();
+    assert_eq!(
+        greentree::publish::load_journal(&git)
+            .unwrap()
+            .unwrap()
+            .parents,
+        vec![parent.clone()],
+        "schema-1 journals migrate to the parent list"
+    );
 
     let report = publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
     assert!(report.resumed, "must take the resume path");
@@ -316,6 +722,37 @@ fn interrupted_publish_resumes_from_journal() {
     assert!(
         !git.state_dir().join("publish-journal.json").exists(),
         "journal cleared after completion"
+    );
+}
+
+#[test]
+fn housekeeping_that_fails_after_the_commit_warns_instead_of_failing() {
+    // A stale `index.lock` (a crashed git, or one still running) makes the
+    // post-commit index sync impossible. The commit exists and the branch
+    // already moved, so reporting failure would invite a retry of a publish
+    // that already happened: it is a warning on a successful report.
+    let (tmp, git) = repo();
+    let cfg = config("true");
+    let mut store = JsonStore::open(&git.state_dir()).unwrap();
+    sh(tmp.path(), "echo v > f.txt");
+    let (name, check) = check_of(&cfg);
+    run_check(&git, &cfg, name, check, &mut store, true).unwrap();
+
+    let lock = tmp.path().join(".git/index.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let report = publish(&git, &cfg, &store, &PublishOptions::default()).unwrap();
+    std::fs::remove_file(&lock).unwrap();
+
+    let commit = report.commit.clone().expect("the commit was still created");
+    assert_eq!(sh(tmp.path(), "git rev-parse HEAD"), commit);
+    assert!(
+        report.warnings.iter().any(|w| w.contains("index sync")),
+        "the failed sync went unreported: {:?}",
+        report.warnings
+    );
+    assert!(
+        !git.state_dir().join("publish-journal.json").exists(),
+        "the publish completed, so its journal is spent"
     );
 }
 
@@ -421,7 +858,7 @@ fn watch_once_verifies_a_settling_tree() {
     let (tmp, git) = repo();
     sh(
         tmp.path(),
-        "printf 'version: 1\\nchecks:\\n  test:\\n    run: \"test -f base.txt\"\\n    watch: true\\n' > greentree.yaml",
+        "printf 'version: 1\\nmin_free_disk: \"0\"\\nchecks:\\n  test:\\n    run: \"test -f base.txt\"\\n    watch: true\\n' > greentree.yaml",
     );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_greentree"))
@@ -464,6 +901,67 @@ fn watch_once_verifies_a_settling_tree() {
         !git.state_dir().join("watch.pid").exists(),
         "pidfile removed on exit"
     );
+}
+
+#[test]
+fn watch_survives_a_disk_floor_refusal() {
+    // A pre-start disk refusal must not be fatal to a long-lived watcher:
+    // it is reported like any other cycle outcome and the next edit is still
+    // picked up. (One-shot `test`/`gate` still exit 16 — see
+    // `a_floor_no_disk_can_meet_refuses_the_run`.)
+    let (tmp, git) = repo();
+    sh(
+        tmp.path(),
+        "printf 'version: 1\\nmin_free_disk: \"100T\"\\nchecks:\\n  test:\\n    run: \"true\"\\n    watch: true\\n' > greentree.yaml",
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_greentree"))
+        .args(["watch", "--json"])
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn watch");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(line);
+        }
+    });
+
+    let wait = std::time::Duration::from_secs(20);
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    sh(tmp.path(), "echo edit > watched.txt");
+    let first = rx.recv_timeout(wait).expect("no refusal line from watch");
+    let v: serde_json::Value = serde_json::from_str(&first).expect("json cycle line");
+    assert_eq!(
+        v["results"][0]["outcome"], "disk_exhausted",
+        "refusal line: {first}"
+    );
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("min_free_disk"),
+        "refusal line names no reason: {first}"
+    );
+
+    // Still watching: a later edit is still verified (here, refused again).
+    sh(tmp.path(), "echo again > watched.txt");
+    let second = rx
+        .recv_timeout(wait)
+        .expect("watch stopped watching after a refusal");
+    assert!(second.contains("disk_exhausted"), "second line: {second}");
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "watch exited on a disk refusal instead of continuing"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = git;
 }
 
 #[test]
@@ -628,6 +1126,7 @@ fn colliding_check_names_get_distinct_logs() {
                 fresh: None,
                 timeout: None,
                 watch: false,
+                min_free_disk: None,
             },
         );
     }
@@ -636,6 +1135,7 @@ fn colliding_check_names_get_distinct_logs() {
         checks,
         snapshot: Default::default(),
         inputs: Vec::new(),
+        min_free_disk: Some(DiskSize(0)),
     };
     let mut store = JsonStore::open(&git.state_dir()).unwrap();
     let dot = run_check(&git, &cfg, "a.b", &cfg.checks["a.b"], &mut store, true).unwrap();
@@ -775,11 +1275,47 @@ fn bin(dir: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
+fn a_floor_no_disk_can_meet_refuses_the_run() {
+    // No box has 100T free, so the floor fires deterministically; setting it
+    // to "0" is the documented escape hatch and must let the same check run.
+    let (tmp, _git) = repo();
+    let cfg = |floor: &str| {
+        format!(
+            "printf 'version: 1\\nmin_free_disk: \"{floor}\"\\nchecks:\\n  \
+             test:\\n    run: \"true\"\\n' > greentree.yaml"
+        )
+    };
+
+    sh(tmp.path(), &cfg("100T"));
+    let (code, _, stderr) = bin(tmp.path(), &["test"]);
+    assert_eq!(code, 16, "disk floor exit code; stderr: {stderr}");
+    for needle in ["test", "100", "min_free_disk"] {
+        assert!(
+            stderr.contains(needle),
+            "refusal must name {needle:?}: {stderr}"
+        );
+    }
+
+    let (code, stdout, _) = bin(tmp.path(), &["test", "--json"]);
+    assert_eq!(code, 16);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json error object");
+    assert_eq!(v["exit_code"], 16);
+    assert!(
+        v["error"].as_str().unwrap().contains("min_free_disk"),
+        "json error names the config key: {stdout}"
+    );
+
+    sh(tmp.path(), &cfg("0"));
+    let (code, stdout, stderr) = bin(tmp.path(), &["test"]);
+    assert_eq!(code, 0, "a zero floor disables it: {stdout}{stderr}");
+}
+
+#[test]
 fn exit_codes_are_the_documented_contract() {
     let (tmp, _git) = repo();
     sh(
         tmp.path(),
-        "printf 'version: 1\\nchecks:\\n  test:\\n    run: \"test -f ok.txt\"\\n    required_for_publish: true\\n' > greentree.yaml",
+        "printf 'version: 1\\nmin_free_disk: \"0\"\\nchecks:\\n  test:\\n    run: \"test -f ok.txt\"\\n    required_for_publish: true\\n' > greentree.yaml",
     );
 
     let (code, _, _) = bin(tmp.path(), &["test"]);

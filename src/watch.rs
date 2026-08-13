@@ -182,7 +182,19 @@ pub fn watch(git: &Git, opts: &WatchOptions) -> Result<()> {
             }
         };
         let _ = worker.join();
-        let results = results?;
+        let results = match results {
+            Ok(results) => results,
+            // A pre-start disk refusal is a refusal, not an outcome — and for
+            // a long-lived watcher it is transient: the disk that is full now
+            // may not be in a minute. Report it and keep watching, exactly
+            // like a timeout or a cancelled cycle. (One-shot `test`/`gate`
+            // still exit 16; there is nothing to wait for there.)
+            Err(e @ Error::DiskFloor { .. }) => {
+                report_refusal(opts, &e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
 
         let cancelled = results
             .iter()
@@ -220,11 +232,7 @@ pub fn watch(git: &Git, opts: &WatchOptions) -> Result<()> {
                     println!(
                         "tree {}  {name} {}{}",
                         short(&r.verdict.tree),
-                        match r.verdict.outcome {
-                            Outcome::Pass => "✓",
-                            Outcome::Fail => "✗",
-                            o => o.as_str(),
-                        },
+                        crate::commands::mark(r.verdict.outcome),
                         if r.cached {
                             " (cached)".to_string()
                         } else {
@@ -239,6 +247,40 @@ pub fn watch(git: &Git, opts: &WatchOptions) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+/// A cycle that never started, in watch's own vocabulary: the same JSON shape
+/// a cycle prints (with a null tree — nothing was judged) plus the reason, and
+/// the same outcome word `test` uses for a check the disk floor stopped.
+fn report_refusal(opts: &WatchOptions, error: &Error) {
+    let check = match error {
+        Error::DiskFloor { check, .. } => check.clone(),
+        _ => String::new(),
+    };
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "tree": serde_json::Value::Null,
+                "results": [{
+                    "check": check,
+                    "outcome": Outcome::DiskExhausted.as_str(),
+                    "cached": false,
+                    "duration_ms": 0,
+                }],
+                "error": error.to_string(),
+            })
+        );
+    } else {
+        println!(
+            "{check} {} — still watching",
+            crate::commands::mark(Outcome::DiskExhausted)
+        );
+        eprintln!("{error}");
+    }
+    // Debug, not warn: both output modes already carry the reason, and the
+    // default filter is `warn` — logging it again would print it twice.
+    tracing::debug!(error = %error, "cycle refused; watch continues");
 }
 
 fn compile_excludes(cfg: &Config) -> Vec<glob::Pattern> {

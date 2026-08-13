@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -30,6 +31,9 @@ const HEAD_CAP: u64 = 4 * 1024 * 1024;
 const TAIL_CAP: usize = 256 * 1024;
 const GRACE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
+/// Free space is sampled at most this often while a check runs — statvfs is
+/// cheap, but the poll loop ticks 20x a second and disk does not.
+const DISK_SAMPLE: Duration = Duration::from_secs(1);
 
 pub struct RunResult {
     pub verdict: Verdict,
@@ -41,6 +45,106 @@ pub struct RunResult {
     /// checks pass it as the next check's `pre_tree` to avoid re-hashing
     /// an unchanged tree.
     pub tree_after: String,
+}
+
+/// Where free-space observations come from. Real runs read statvfs; tests
+/// inject a fake, so the floor logic is exercised without filling a disk.
+pub trait FreeSpace {
+    fn free_bytes(&self) -> Result<u64>;
+}
+
+/// The filesystem holding a path, via statvfs.
+pub struct Statvfs<'a>(pub &'a Path);
+
+impl FreeSpace for Statvfs<'_> {
+    fn free_bytes(&self) -> Result<u64> {
+        free_bytes(self.0)
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, counted from the blocks
+/// *available* to an unprivileged writer (f_bavail) — the root-reserved
+/// remainder is not space a check can use.
+pub fn free_bytes(path: &Path) -> Result<u64> {
+    let s = nix::sys::statvfs::statvfs(path)
+        .map_err(|e| std::io::Error::other(format!("statvfs {}: {e}", path.display())))?;
+    // The block-count and fragment-size widths differ across platforms, so
+    // these casts are redundant only on some of them.
+    #[allow(clippy::unnecessary_cast)]
+    let free = (s.blocks_available() as u64).saturating_mul(s.fragment_size() as u64);
+    Ok(free)
+}
+
+/// A floor of 0 disables the check entirely — that is the documented way to
+/// opt out, and it must never be read as "refuse everything".
+fn below_floor(free: u64, floor: u64) -> bool {
+    floor > 0 && free < floor
+}
+
+/// Refuse to START a check that would begin with less than its floor of free
+/// disk. A refusal is not an outcome: like an unsnapshotable tree, nothing is
+/// recorded. Returns the free bytes observed, which the verdict carries.
+///
+/// A floor of 0 is the documented opt-out, so it must not be able to fail a
+/// run: the observation is skipped entirely (a statvfs that errors on an
+/// exotic filesystem cannot refuse a check whose floor is disabled), and the
+/// verdict records 0 free bytes — "not observed".
+fn admit(name: &str, root: &Path, floor: u64, space: &dyn FreeSpace) -> Result<u64> {
+    if floor == 0 {
+        return Ok(0);
+    }
+    let free = space.free_bytes()?;
+    if below_floor(free, floor) {
+        return Err(crate::Error::DiskFloor {
+            check: name.to_string(),
+            floor,
+            free,
+            root: root.display().to_string(),
+        });
+    }
+    Ok(free)
+}
+
+/// Mid-run disk supervision: samples free space at a bounded interval and
+/// says when the check must die. Split out of the poll loop so the decision
+/// is unit-testable.
+struct DiskGuard<'a> {
+    floor: u64,
+    space: &'a dyn FreeSpace,
+    interval: Duration,
+    last: Instant,
+    min_free: u64,
+}
+
+impl<'a> DiskGuard<'a> {
+    fn new(floor: u64, space: &'a dyn FreeSpace, start_free: u64, now: Instant) -> DiskGuard<'a> {
+        DiskGuard {
+            floor,
+            space,
+            interval: DISK_SAMPLE,
+            last: now,
+            min_free: start_free,
+        }
+    }
+
+    /// True when free space has fallen below the floor and the check must be
+    /// killed. A statvfs that fails is not a reason to kill a running check.
+    fn exhausted(&mut self, now: Instant) -> bool {
+        if self.floor == 0 || now.duration_since(self.last) < self.interval {
+            return false;
+        }
+        self.last = now;
+        match self.space.free_bytes() {
+            Ok(free) => {
+                self.min_free = self.min_free.min(free);
+                below_floor(free, self.floor)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "free-space sample failed; not killing the check");
+                false
+            }
+        }
+    }
 }
 
 pub fn run_check(
@@ -93,6 +197,13 @@ pub fn run_check_with(
             });
         }
     }
+
+    // Governed like time: a check that cannot start with room is refused
+    // before anything is anchored or spawned. A cache hit never gets here —
+    // no process runs, so no disk is at risk.
+    let floor = cfg.disk_floor(check);
+    let space = Statvfs(&git.root);
+    let disk_free_start = admit(name, &git.root, floor, &space)?;
 
     // Only trees a check actually runs against get anchored.
     anchor(git, &tree)?;
@@ -174,6 +285,8 @@ pub fn run_check_with(
                 0,
                 blake3::Hasher::new(),
                 false,
+                disk_free_start,
+                disk_free_start,
             );
             let tree_after = tree.clone();
             return Ok(RunResult {
@@ -191,9 +304,10 @@ pub fn run_check_with(
     let t_out = drain(stdout, Arc::clone(&sink));
     let t_err = drain(stderr, Arc::clone(&sink));
 
-    // Wait with timeout/cancel; escalate SIGTERM -> SIGKILL on the process group.
+    // Wait with timeout/cancel/disk; escalate SIGTERM -> SIGKILL on the process group.
     let pgid = Pid::from_raw(child.id() as i32);
     let mut killed: Option<Outcome> = None;
+    let mut disk = DiskGuard::new(floor, &space, disk_free_start, Instant::now());
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -205,6 +319,10 @@ pub fn run_check_with(
             .unwrap_or(false)
         {
             Some(Outcome::Cancelled)
+        } else if disk.exhausted(Instant::now()) {
+            // The check started with room and ate it: kill it the same way a
+            // timeout does, before it takes the filesystem with it.
+            Some(Outcome::DiskExhausted)
         } else {
             None
         };
@@ -299,6 +417,8 @@ pub fn run_check_with(
         total,
         hasher,
         total > HEAD_CAP,
+        disk_free_start,
+        disk.min_free,
     );
 
     if outcome.cacheable() {
@@ -332,6 +452,8 @@ fn build_verdict(
     log_bytes: u64,
     hasher: blake3::Hasher,
     log_truncated: bool,
+    disk_free_start_bytes: u64,
+    disk_free_min_bytes: u64,
 ) -> Verdict {
     let finished_at = SystemTime::now();
     Verdict {
@@ -349,6 +471,8 @@ fn build_verdict(
         started: humantime::format_rfc3339_seconds(started_at).to_string(),
         finished: humantime::format_rfc3339_seconds(finished_at).to_string(),
         duration_ms: started_mono.elapsed().as_millis() as u64,
+        disk_free_start_bytes,
+        disk_free_min_bytes,
         finished_unix: unix_secs(finished_at),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
@@ -474,4 +598,119 @@ fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A scripted disk: each observation pops the next value, and the last
+    /// one repeats.
+    struct Fake(Cell<usize>, Vec<u64>);
+
+    impl Fake {
+        fn new(readings: &[u64]) -> Fake {
+            Fake(Cell::new(0), readings.to_vec())
+        }
+    }
+
+    impl FreeSpace for Fake {
+        fn free_bytes(&self) -> Result<u64> {
+            let i = self.0.get();
+            self.0.set((i + 1).min(self.1.len() - 1));
+            Ok(self.1[i])
+        }
+    }
+
+    struct Broken;
+
+    impl FreeSpace for Broken {
+        fn free_bytes(&self) -> Result<u64> {
+            Err(crate::Error::Io(std::io::Error::other("no statvfs")))
+        }
+    }
+
+    const G: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn a_check_below_the_floor_is_refused_before_it_starts() {
+        let root = Path::new("/repo");
+        match admit("full", root, 60 * G, &Fake::new(&[4 * G])) {
+            Err(crate::Error::DiskFloor {
+                check, floor, free, ..
+            }) => {
+                assert_eq!(check, "full");
+                assert_eq!((floor, free), (60 * G, 4 * G));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn room_above_the_floor_admits_and_reports_free_space() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            admit("full", root, 10 * G, &Fake::new(&[27 * G])).unwrap(),
+            27 * G
+        );
+        // Exactly at the floor is room enough; a zero floor admits anything.
+        assert_eq!(
+            admit("full", root, 10 * G, &Fake::new(&[10 * G])).unwrap(),
+            10 * G
+        );
+        // A zero floor admits without observing at all (see below).
+        assert_eq!(admit("full", root, 0, &Fake::new(&[1024])).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_disabled_floor_admits_without_consulting_the_disk() {
+        // "0" is the documented opt-out, so a filesystem whose statvfs fails
+        // must not be able to refuse the run through it.
+        assert_eq!(admit("full", Path::new("/repo"), 0, &Broken).unwrap(), 0);
+        assert!(
+            admit("full", Path::new("/repo"), 1, &Broken).is_err(),
+            "with a floor set, an unobservable disk is still an error"
+        );
+    }
+
+    #[test]
+    fn falling_below_the_floor_mid_run_aborts_the_check() {
+        let space = Fake::new(&[30 * G, 20 * G, 3 * G]);
+        let t0 = Instant::now();
+        let mut guard = DiskGuard::new(10 * G, &space, 40 * G, t0);
+        // Sampling is rate-limited: a tick inside the interval reads nothing.
+        assert!(!guard.exhausted(t0 + Duration::from_millis(100)));
+        assert_eq!(guard.min_free, 40 * G);
+
+        assert!(!guard.exhausted(t0 + DISK_SAMPLE));
+        assert!(!guard.exhausted(t0 + 2 * DISK_SAMPLE));
+        assert_eq!(guard.min_free, 20 * G, "the low-water mark tracks the run");
+
+        assert!(
+            guard.exhausted(t0 + 3 * DISK_SAMPLE),
+            "a drop below the floor must kill the check"
+        );
+        assert_eq!(guard.min_free, 3 * G);
+    }
+
+    #[test]
+    fn a_zero_floor_and_a_broken_statvfs_never_kill_a_check() {
+        let t0 = Instant::now();
+        let space = Fake::new(&[1]);
+        let mut off = DiskGuard::new(0, &space, 1, t0);
+        assert!(!off.exhausted(t0 + 10 * DISK_SAMPLE));
+
+        let mut blind = DiskGuard::new(10 * G, &Broken, 40 * G, t0);
+        assert!(!blind.exhausted(t0 + DISK_SAMPLE));
+        assert_eq!(blind.min_free, 40 * G);
+    }
+
+    #[test]
+    fn free_space_of_the_repo_filesystem_is_observable() {
+        // Not an assertion about this box, just that the syscall path works
+        // and a nonexistent path is an error rather than a silent zero.
+        free_bytes(Path::new(".")).expect("statvfs on the cwd");
+        assert!(free_bytes(Path::new("/nonexistent-greentree-test")).is_err());
+    }
 }

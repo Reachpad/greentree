@@ -228,6 +228,9 @@ fn test(cli: &Cli, git: &Git, only: Option<&str>, no_cache: bool) -> crate::Resu
     Ok(match worst {
         Outcome::Pass => exit::OK,
         Outcome::Fail => exit::CHECK_FAILED,
+        // Aborted for the same reason a pre-start refusal fires, so it
+        // reports the same code: an agent branches on 16 either way.
+        Outcome::DiskExhausted => exit::DISK_FLOOR,
         _ => exit::ERROR,
     })
 }
@@ -246,14 +249,23 @@ fn status(cli: &Cli, git: &Git) -> crate::Result<u8> {
         Some(h) => git.rev_parse_opt(&format!("{h}^{{tree}}"))?,
         None => None,
     };
+    // Detached HEAD (mid-rebase, or a bare checkout) has no branch name:
+    // JSON says null rather than an empty string that reads like a branch
+    // whose name we failed to print.
     let branch = git
         .run_unchecked(["symbolic-ref", "-q", "--short", "HEAD"])?
         .stdout;
     let branch = String::from_utf8_lossy(&branch).trim().to_string();
+    let branch = (!branch.is_empty()).then_some(branch);
     let now = SystemTime::now();
 
+    // A rebase leaves an honest, testable tree that still cannot be
+    // published; `publishable` must not promise a publish that would refuse.
+    let blocked = crate::publish::refuse_unpublishable(git)
+        .err()
+        .map(|e| e.to_string());
     let mut checks = Vec::new();
-    let mut publishable = true;
+    let mut publishable = blocked.is_none();
     for (name, check) in cfg.required_checks() {
         let key = VerdictKey {
             tree: tree.clone(),
@@ -281,6 +293,10 @@ fn status(cli: &Cli, git: &Git) -> crate::Result<u8> {
 
     let journal = load_journal(git)?;
     let at_head = head_tree.as_deref() == Some(&*tree);
+    // Mid-merge, "already committed at HEAD" is not the whole truth: publish
+    // still writes the merge commit, because a merge records history rather
+    // than content.
+    let merging = crate::publish::merge_in_progress(git)?;
 
     if cli.json {
         println!(
@@ -290,7 +306,9 @@ fn status(cli: &Cli, git: &Git) -> crate::Result<u8> {
                 "branch": branch,
                 "head": head,
                 "tree_at_head": at_head,
+                "merge_in_progress": merging,
                 "publishable": publishable,
+                "publish_blocked": blocked,
                 "checks": checks.iter().map(|(name, state, v)| json!({
                     "check": name,
                     "state": state,
@@ -302,12 +320,23 @@ fn status(cli: &Cli, git: &Git) -> crate::Result<u8> {
             })
         );
     } else {
-        println!("tree {}  branch {}", short(&tree), branch);
+        println!(
+            "tree {}  branch {}",
+            short(&tree),
+            branch.as_deref().unwrap_or("(detached)")
+        );
         for (name, state, _) in &checks {
             println!("  {name}: {state}");
         }
         if at_head {
-            println!("  tree already committed at HEAD");
+            if merging {
+                println!(
+                    "  tree already committed at HEAD, but a merge is in progress — \
+                     publish still writes the merge commit"
+                );
+            } else {
+                println!("  tree already committed at HEAD");
+            }
         }
         if let Some(j) = &journal {
             println!(
@@ -315,14 +344,17 @@ fn status(cli: &Cli, git: &Git) -> crate::Result<u8> {
                 short(&j.tree)
             );
         }
-        println!(
-            "  publish: {}",
-            if publishable {
-                "would succeed"
-            } else {
-                "would refuse"
-            }
-        );
+        match &blocked {
+            Some(reason) => println!("  publish: would refuse ({reason})"),
+            None => println!(
+                "  publish: {}",
+                if publishable {
+                    "would succeed"
+                } else {
+                    "would refuse"
+                }
+            ),
+        }
     }
     Ok(exit::OK)
 }
@@ -331,6 +363,9 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
     let _lock = lock::acquire(&git.state_dir())?;
     let cfg = Config::effective(&git.root)?;
     let mut store = JsonStore::open(&git.state_dir())?;
+    // Refuse BEFORE running the checks: gate ends in a publish, so a state
+    // that cannot publish should not cost the agent a full check run first.
+    crate::publish::refuse_unpublishable(git)?;
 
     let mut results: Vec<(String, RunResult)> = Vec::new();
     let mut pre_tree: Option<String> = None;
@@ -361,6 +396,7 @@ fn gate(cli: &Cli, git: &Git, push: bool, message: Option<String>) -> crate::Res
             }
             return Ok(match outcome {
                 Outcome::Fail => exit::CHECK_FAILED,
+                Outcome::DiskExhausted => exit::DISK_FLOOR,
                 _ => exit::ERROR,
             });
         }
@@ -478,10 +514,13 @@ fn maybe_post_statuses(
     let Some(commit) = &report.commit else {
         return Statuses::default();
     };
-    if crate::github::token_from_env().is_none() {
-        tracing::debug!("no GitHub token in env; skipping status posting");
+    // Resolved ONCE and threaded through: the `gh` step of the chain is a
+    // subprocess spawn, and a presence check followed by a second resolve
+    // inside the poster would pay for it twice (up to 10 s).
+    let Some(token) = crate::github::resolve_token() else {
+        tracing::debug!("no GitHub token available; skipping status posting");
         return Statuses::default();
-    }
+    };
     match crate::github::remote_url(git) {
         Some(url) if crate::github::parse_github_remote(&url).is_some() => {}
         _ => return Statuses::default(),
@@ -497,7 +536,7 @@ fn maybe_post_statuses(
     } else {
         report.verified_by.clone()
     };
-    match crate::github::post_statuses(git, commit, &report.tree, &checks) {
+    match crate::github::post_statuses_with_token(git, commit, &report.tree, &checks, &token) {
         Ok(posted) => Statuses {
             posted,
             error: None,
@@ -549,13 +588,16 @@ fn names(cfg: &Config) -> String {
     cfg.checks.keys().cloned().collect::<Vec<_>>().join(", ")
 }
 
-fn mark(o: Outcome) -> &'static str {
+/// One check outcome, as every verb prints it (watch included, so an agent
+/// reads the same words everywhere).
+pub(crate) fn mark(o: Outcome) -> &'static str {
     match o {
         Outcome::Pass => "✓",
         Outcome::Fail => "✗",
         Outcome::Error => "error",
         Outcome::Timeout => "timeout",
         Outcome::Cancelled => "cancelled (tree changed mid-run)",
+        Outcome::DiskExhausted => "aborted (free disk fell below min_free_disk)",
     }
 }
 
@@ -564,7 +606,7 @@ fn worse(a: Outcome, b: Outcome) -> Outcome {
     let rank = |o: Outcome| match o {
         Pass => 0,
         Fail => 2,
-        Error | Timeout | Cancelled => 1,
+        Error | Timeout | Cancelled | DiskExhausted => 1,
     };
     if rank(b) > rank(a) {
         b
