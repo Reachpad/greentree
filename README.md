@@ -4,6 +4,9 @@
 
 <h1 align="center">greentree</h1>
 
+> [!WARNING]
+> This project is retired. Do not install it or configure it in agent environments.
+
 <p align="center"><b>Test the tree, not every commit.</b></p>
 
 <p align="center">
@@ -12,7 +15,7 @@ and refuses to create a commit from any tree that has not passed.
 </p>
 
 <p align="center">
-Built for coding agents: one verb, JSON on every command, stable exit codes, and a drop-in skill.<br>
+Built for coding agents: one verb, JSON on every command, and stable exit codes.<br>
 An open source primitive from <a href="https://reachpad.dev">reachpad</a> · Apache-2.0 · Linux and macOS
 </p>
 
@@ -234,22 +237,6 @@ stable exit code, so an agent branches on the code, never on parsed text:
 verified yet (run `test` first), `12` unsnapshotable, `13` locked. No
 prose to interpret, no re-running "to be sure" — a cache hit proves the
 content already passed.
-
-**Drop-in skill.** [`skills/greentree/`](skills/greentree/SKILL.md) is a
-Claude Code skill that teaches an agent the workflow and the exit codes.
-Copy it into a project so the agent loads it automatically:
-
-```sh
-cp -r skills/greentree .claude/skills/
-```
-
-The skill tells the agent to land changes with `greentree gate` instead of
-raw `git commit`/`git push`, how to react to each exit code, and not to
-re-run cached verdicts.
-
-**Enforce it.** [docs/AGENTS.md](docs/AGENTS.md) has a project-instructions
-snippet and a Claude Code hook that blocks `git commit`/`git push` so the
-gate is the only door, even if the agent forgets.
 
 ### The gate before GitHub
 
